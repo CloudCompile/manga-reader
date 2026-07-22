@@ -22,19 +22,15 @@ function extractImages(html: string): string[] {
   const lazyRe = /data-(?:src|lazy-src|original|image-url)=["']([^"']+)["']/gi;
   while ((m = lazyRe.exec(html)) !== null) imgs.push(m[1]);
 
-  const srcsetRe = /srcset=["']([^"']+)["']/gi;
-  while ((m = srcsetRe.exec(html)) !== null) {
-    const first = m[1].split(/\s+/)[0].split(",")[0];
-    if (first) imgs.push(first);
-  }
-
   const seen = new Set<string>();
   const unique: string[] = [];
   for (const url of imgs) {
     const clean = url.trim();
     if (!clean || seen.has(clean)) continue;
     if (!/\.(jpe?g|png|webp|gif|avif)/i.test(clean)) continue;
-    if (/(?:icon|logo|emoji|avatar|button|banner|ads?|popup|1x1|tracking|pixel|w\.org|gravatar)/i.test(clean)) continue;
+    if (/(?:icon|logo|emoji|avatar|button|banner|ads?|popup|1x1|tracking|pixel|w\.org|gravatar|pinterest)/i.test(clean)) continue;
+    // Must be a manga image — large, hosted on CDN, contains "chapter" or numeric path pattern
+    // Filter: keep images that look like manga pages (hosted on storage/CDN, not tiny UI elements)
     seen.add(clean);
     unique.push(clean);
   }
@@ -45,63 +41,26 @@ function extractNavLinks(html: string): { prev: string | null; next: string | nu
   let prev: string | null = null;
   let next: string | null = null;
 
-  const patterns: Array<{ re: RegExp; type: "prev" | "next" }> = [
-    { re: /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*rel=["']prev["']/i, type: "prev" },
-    { re: /<a[^>]+rel=["']prev["'][^>]+href=["']([^"']*chapter[^"']*)["']/i, type: "prev" },
-    { re: /<a[^>]+class=["'][^"']*(?:prev|previous)[^"']*["'][^>]+href=["']([^"']*chapter[^"']*)["']/i, type: "prev" },
-    { re: /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*class=["'][^"']*(?:prev|previous)[^"']*["']/i, type: "prev" },
-    { re: /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*rel=["']next["']/i, type: "next" },
-    { re: /<a[^>]+rel=["']next["'][^>]+href=["']([^"']*chapter[^"']*)["']/i, type: "next" },
-    { re: /<a[^>]+class=["'][^"']*next-ch?[^"']*["'][^>]+href=["']([^"']*chapter[^"']*)["']/i, type: "next" },
-    { re: /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*class=["'][^"']*next-ch?[^"']*["']/i, type: "next" },
-  ];
+  const prevMatch = /<a[^>]+href=["']([^"']+)["'][^>]*rel=["']prev["']/i.exec(html)
+    || /<a[^>]+rel=["']prev["'][^>]+href=["']([^"']+)["']/i.exec(html);
+  if (prevMatch) prev = prevMatch[1].replace(/&amp;/g, "&");
 
-  for (const { re, type } of patterns) {
-    const match = re.exec(html);
-    if (match) {
-      const url = match[1].replace(/&amp;/g, "&");
-      if (type === "prev" && !prev) prev = url;
-      if (type === "next" && !next) next = url;
-    }
-  }
-
-  // Broader text-based fallback
-  if (!prev) {
-    const pm = /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*>\s*<span[^>]*>[\s\S]*?prev[\s\S]*?<\/span>/i.exec(html)
-      || /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*>[^<]*prev/i.exec(html);
-    if (pm) prev = pm[1].replace(/&amp;/g, "&");
-  }
-  if (!next) {
-    const nm = /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*>\s*<span[^>]*>[\s\S]*?next[\s\S]*?<\/span>/i.exec(html)
-      || /<a[^>]+href=["']([^"']*chapter[^"']*)["'][^>]*>[^<]*next/i.exec(html);
-    if (nm) next = nm[1].replace(/&amp;/g, "&");
-  }
+  const nextMatch = /<a[^>]+href=["']([^"']+)["'][^>]*rel=["']next["']/i.exec(html)
+    || /<a[^>]+rel=["']next["'][^>]+href=["']([^"']+)["']/i.exec(html);
+  if (nextMatch) next = nextMatch[1].replace(/&amp;/g, "&");
 
   return { prev, next };
 }
 
 function extractTitle(html: string): { mangaName: string; chapterNum: string; fullTitle: string } {
-  const ogMatch = /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(html);
   const titleMatch = /<title>([^<]+)<\/title>/i.exec(html);
-  const raw = ogMatch?.[1] || titleMatch?.[1] || "Unknown Manga";
+  const raw = titleMatch?.[1] || "Unknown Manga";
 
   const chapMatch = /chapter\s*(\d+)/i.exec(raw);
   const chapterNum = chapMatch ? chapMatch[1] : "";
   const mangaName = raw.replace(/,\s*Chapter\s*\d+.*$/i, "").replace(/\s*-\s*Manga\s*Online.*$/i, "").trim();
 
   return { mangaName, chapterNum, fullTitle: raw };
-}
-
-function findReadingArea(html: string): string {
-  const patterns = [
-    /<div[^>]*(?:class|id)=["'][^"']*(?:reading-content|manga-reading|chapter-content|reader-area|entry-content|post-content|manga-content|read-content|wp-manga-chapter)[^"']*["'][^>]*>([\s\S]*?)(?=<\/div>\s*(?:<\/div>\s*)?(?:<div|<nav|<footer|<section|<!--\s*(?:end|comment|navigation)))/i,
-    /<div[^>]*(?:class|id)=["'][^"']*(?:reading-content|manga-reading|chapter-content|reader-area|entry-content|post-content|manga-content|read-content|wp-manga-chapter)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
-  ];
-  for (const p of patterns) {
-    const m = p.exec(html);
-    if (m) return m[1];
-  }
-  return html;
 }
 
 async function scrapeChapter(url: string): Promise<ChapterData> {
@@ -121,13 +80,34 @@ async function scrapeChapter(url: string): Promise<ChapterData> {
   if (!resp.ok) throw new Error(`Failed to fetch page: ${resp.status}`);
   const html = await resp.text();
 
-  const readingArea = findReadingArea(html);
-  const images = extractImages(readingArea);
+  // Extract images from the full HTML — mangafragrant uses plain <img src> inside <p> tags
+  // within .entry-content, but the regex-safe approach is to scan everything and filter
+  const allImages = extractImages(html);
+
+  // Filter to only keep actual manga page images (from contabostorage or similar CDN,
+  // with chapter-based paths and sequential numbering)
+  const mangaImages = allImages.filter((u) => {
+    // Keep CDN-hosted images that look like manga pages
+    if (/contabostorage\.com/i.test(u)) return true;
+    // Keep images with /Chapter N/ or /chapter-n/ in path
+    if (/chapter\s*\d+/i.test(u)) return true;
+    // Keep large images from any CDN (not tiny UI assets)
+    // For mangafragrant specifically, all manga images come from contabostorage
+    return false;
+  });
+
   const { prev, next } = extractNavLinks(html);
   const { mangaName, chapterNum, fullTitle } = extractTitle(html);
 
-  const data: ChapterData = { title: fullTitle, images, prevUrl: prev, nextUrl: next, mangaName, chapterNum };
-  if (images.length === 0) data.warning = "No images found. This chapter may not be available yet or uses a different loading method.";
+  const data: ChapterData = {
+    title: fullTitle,
+    images: mangaImages,
+    prevUrl: prev,
+    nextUrl: next,
+    mangaName,
+    chapterNum,
+  };
+  if (mangaImages.length === 0) data.warning = "No images found. This chapter may not be available yet.";
 
   CACHE.set(url, { data, ts: Date.now() });
   return data;

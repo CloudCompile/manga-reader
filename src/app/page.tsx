@@ -29,7 +29,7 @@ type Theme = "dark" | "light";
 type FitMode = "width" | "height" | "original";
 
 export default function MangaReader() {
-  const [url, setUrl] = useState("https://www.mangafragrant.com/manga/the-fragrant-flower-blooms-with-dignity-chapter-182/");
+  const [url, setUrl] = useState("");
   const [data, setData] = useState<ChapterData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -102,11 +102,6 @@ export default function MangaReader() {
 
   const scrollToTop = () => {
     scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const scrollToImage = (index: number) => {
-    const img = imgRefs.current.get(index);
-    if (img) img.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   const toggleTheme = () => {
@@ -192,8 +187,9 @@ export default function MangaReader() {
     );
   }
 
-  // ─── Reader view ───
   const isDark = theme === "dark";
+  const proxyUrl = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
+  const displayImages = data.images.map(proxyUrl);
   const bg = isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]";
   const textCol = isDark ? "text-white" : "text-gray-900";
   const subText = isDark ? "text-white/50" : "text-gray-500";
@@ -278,7 +274,7 @@ export default function MangaReader() {
 
         {/* Images */}
         <div className="flex flex-col items-center">
-          {data.images.map((src, i) => (
+          {displayImages.map((src, i) => (
             <div key={i} className="relative w-full">
               {!loadedImages.has(i) && (
                 <Skeleton
@@ -289,7 +285,6 @@ export default function MangaReader() {
                   }}
                 />
               )}
-              { }
               <img
                 ref={(el) => {
                   if (el) imgRefs.current.set(i, el);
@@ -301,7 +296,7 @@ export default function MangaReader() {
                   ...imgStyle,
                   display: loadedImages.has(i) ? "block" : "none",
                 }}
-                loading="lazy"
+                loading="eager"
                 className={isDark ? "" : ""}
               />
             </div>
