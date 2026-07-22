@@ -62,17 +62,21 @@ const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
 // ─── LocalStorage helpers ────────────────────────────
 function getHistory(): HistoryEntry[] {
+  if (typeof window === "undefined") return [];
   try { return JSON.parse(localStorage.getItem("manga-history") || "[]"); } catch { return []; }
 }
 function saveHistory(entry: HistoryEntry) {
+  if (typeof window === "undefined") return;
   const h = getHistory().filter((e) => e.url !== entry.url);
   h.unshift({ ...entry, timestamp: Date.now() });
   localStorage.setItem("manga-history", JSON.stringify(h.slice(0, 50)));
 }
 function getLastRead(): string | null {
+  if (typeof window === "undefined") return null;
   return localStorage.getItem("manga-last-read");
 }
 function setLastRead(url: string) {
+  if (typeof window === "undefined") return;
   localStorage.setItem("manga-last-read", url);
 }
 
@@ -82,6 +86,7 @@ const DB_VERSION = 1;
 const STORE = "chapters";
 
 function openDB(): Promise<IDBDatabase> {
+  if (typeof window === "undefined") throw new Error("SSR");
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: "url" });
@@ -137,9 +142,7 @@ export default function MangaReader() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showScrollTop, setShowScrollTop] = useState(false);
-  const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem("manga-theme") as Theme) || "dark"
-  );
+  const [theme, setTheme] = useState<Theme>("dark");
   const [fitMode, setFitMode] = useState<FitMode>("width");
   const [loadedImages, setLoadedImages] = useState<Set<number>>(new Set());
   const [chapters, setChapters] = useState<ChapterItem[]>([]);
@@ -169,6 +172,8 @@ export default function MangaReader() {
     getAllOffline().then(setOfflineChapters).catch(() => {});
     const saved = getLastRead();
     if (saved) setUrl(saved);
+    const savedTheme = localStorage?.getItem("manga-theme");
+    if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
   }, []);
 
   // Scroll listener

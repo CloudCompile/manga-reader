@@ -1,0 +1,656 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useState, useCallback, useEffect, useRef } from "react";
+     4→     4→import { Button } from "@/components/ui/button";
+     5→     5→import { Input } from "@/components/ui/input";
+     6→     6→import { Skeleton } from "@/components/ui/skeleton";
+     7→     7→import { ScrollArea } from "@/components/ui/scroll-area";
+     8→     8→import {
+     9→     9→  ChevronLeft,
+    10→    10→  ChevronRight,
+    11→    11→  Loader2,
+    12→    12→  BookOpen,
+    13→    13→  ArrowUp,
+    14→    14→  Sun,
+    15→    15→  Moon,
+    16→    16→  List,
+    17→    17→  Search,
+    18→    18→  X,
+    19→    19→  History,
+    20→    20→  Download,
+    21→    21→  ChevronDown,
+    22→    22→  Menu,
+    23→    23→} from "lucide-react";
+    24→    24→
+    25→    25→// ─── Types ───────────────────────────────────────────
+    26→    26→interface ChapterData {
+    27→    27→  title: string;
+    28→    28→  images: string[];
+    29→    29→  prevUrl: string | null;
+    30→    30→  nextUrl: string | null;
+    31→    31→  mangaName: string;
+    32→    32→  chapterNum: string;
+    33→    33→  seriesSlug: string;
+    34→    34→  warning?: string;
+    35→    35→}
+    36→    36→
+    37→    37→interface ChapterItem {
+    38→    38→  num: number;
+    39→    39→  url: string;
+    40→    40→  title: string;
+    41→    41→}
+    42→    42→
+    43→    43→interface HistoryEntry {
+    44→    44→  url: string;
+    45→    45→  mangaName: string;
+    46→    46→  chapterNum: string;
+    47→    47→  timestamp: number;
+    48→    48→}
+    49→    49→
+    50→    50→interface OfflineChapter {
+    51→    51→  url: string;
+    52→    52→  mangaName: string;
+    53→    53→  chapterNum: string;
+    54→    54→  images: string[];
+    55→    55→  savedAt: number;
+    56→    56→}
+    57→    57→
+    58→    58→type Theme = "dark" | "light";
+    59→    59→type FitMode = "width" | "height" | "original";
+    60→    60→
+    61→    61→const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
+    62→    62→
+    63→    63→// ─── LocalStorage helpers ────────────────────────────
+    64→    64→function getHistory(): HistoryEntry[] {
+    65→    65→  try { return JSON.parse(localStorage.getItem("manga-history") || "[]"); } catch { return []; }
+    66→    66→}
+    67→    67→function saveHistory(entry: HistoryEntry) {
+    68→    68→  const h = getHistory().filter((e) => e.url !== entry.url);
+    69→    69→  h.unshift({ ...entry, timestamp: Date.now() });
+    70→    70→  localStorage.setItem("manga-history", JSON.stringify(h.slice(0, 50)));
+    71→    71→}
+    72→    72→function getLastRead(): string | null {
+    73→    73→  return localStorage.getItem("manga-last-read");
+    74→    74→}
+    75→    75→function setLastRead(url: string) {
+    76→    76→  localStorage.setItem("manga-last-read", url);
+    77→    77→}
+    78→    78→
+    79→    79→// ─── IndexedDB for offline ───────────────────────────
+    80→    80→const DB_NAME = "manga-offline";
+    81→    81→const DB_VERSION = 1;
+    82→    82→const STORE = "chapters";
+    83→    83→
+    84→    84→function openDB(): Promise<IDBDatabase> {
+    85→    85→  return new Promise((resolve, reject) => {
+    86→    86→    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    87→    87→    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: "url" });
+    88→    88→    req.onsuccess = () => resolve(req.result);
+    89→    89→    req.onerror = () => reject(req.error);
+    90→    90→  });
+    91→    91→}
+    92→    92→
+    93→    93→async function saveOffline(data: OfflineChapter) {
+    94→    94→  const db = await openDB();
+    95→    95→  return new Promise<void>((resolve, reject) => {
+    96→    96→    const tx = db.transaction(STORE, "readwrite");
+    97→    97→    tx.objectStore(STORE).put(data);
+    98→    98→    tx.oncomplete = () => resolve();
+    99→    99→    tx.onerror = () => reject(tx.error);
+   100→   100→  });
+   101→   101→}
+   102→   102→
+   103→   103→async function getOffline(url: string): Promise<OfflineChapter | null> {
+   104→   104→  const db = await openDB();
+   105→   105→  return new Promise((resolve, reject) => {
+   106→   106→    const tx = db.transaction(STORE, "readonly");
+   107→   107→    const req = tx.objectStore(STORE).get(url);
+   108→   108→    req.onsuccess = () => resolve(req.result || null);
+   109→   109→    req.onerror = () => reject(req.error);
+   110→   110→  });
+   111→   111→}
+   112→   112→
+   113→   113→async function getAllOffline(): Promise<OfflineChapter[]> {
+   114→   114→  const db = await openDB();
+   115→   115→  return new Promise((resolve, reject) => {
+   116→   116→    const tx = db.transaction(STORE, "readonly");
+   117→   117→    const req = tx.objectStore(STORE).getAll();
+   118→   118→    req.onsuccess = () => resolve(req.result || []);
+   119→   119→    req.onerror = () => reject(req.error);
+   120→   120→  });
+   121→   121→}
+   122→   122→
+   123→   123→async function deleteOffline(url: string) {
+   124→   124→  const db = await openDB();
+   125→   125→  return new Promise<void>((resolve, reject) => {
+   126→   126→    const tx = db.transaction(STORE, "readwrite");
+   127→   127→    tx.objectStore(STORE).delete(url);
+   128→   128→    tx.oncomplete = () => resolve();
+   129→   129→    tx.onerror = () => reject(tx.error);
+   130→   130→  });
+   131→   131→}
+   132→   132→
+   133→   133→// ─── Component ───────────────────────────────────────
+   134→   134→export default function MangaReader() {
+   135→   135→  const [url, setUrl] = useState("");
+   136→   136→  const [data, setData] = useState<ChapterData | null>(null);
+   137→   137→  const [loading, setLoading] = useState(false);
+   138→   138→  const [error, setError] = useState("");
+   139→   139→  const [showScrollTop, setShowScrollTop] = useState(false);
+   140→   140→  const [theme, setTheme] = useState<Theme>(
+   141→   141→    () => (localStorage.getItem("manga-theme") as Theme) || "dark"
+   142→   142→  );
+   143→   143→  const [fitMode, setFitMode] = useState<FitMode>("width");
+   144→   144→  const [loadedImages, setLoadedImages] = useState<Set<number>>(new Set());
+   145→   145→  const [chapters, setChapters] = useState<ChapterItem[]>([]);
+   146→   146→  const [chaptersLoading, setChaptersLoading] = useState(false);
+   147→   147→  const [showChapters, setShowChapters] = useState(false);
+   148→   148→  const [showSearch, setShowSearch] = useState(false);
+   149→   149→  const [searchQuery, setSearchQuery] = useState("");
+   150→   150→  const [searchResults, setSearchResults] = useState<{ title: string; latestChapter: string; url: string }[]>([]);
+   151→   151→  const [searchLoading, setSearchLoading] = useState(false);
+   152→   152→  const [history, setHistory] = useState<HistoryEntry[]>([]);
+   153→   153→  const [showHistory, setShowHistory] = useState(false);
+   154→   154→  const [offlineChapters, setOfflineChapters] = useState<OfflineChapter[]>([]);
+   155→   155→  const [showOffline, setShowOffline] = useState(false);
+   156→   156→  const [currentPage, setCurrentPage] = useState(0);
+   157→   157→  const [pageInput, setPageInput] = useState("");
+   158→   158→  const [showPageJumper, setShowPageJumper] = useState(false);
+   159→   159→  const [savingOffline, setSavingOffline] = useState(false);
+   160→   160→  const [isOfflineMode, setIsOfflineMode] = useState(false);
+   161→   161→  const [showMobileMenu, setShowMobileMenu] = useState(false);
+   162→   162→
+   163→   163→  const scrollRef = useRef<HTMLDivElement>(null);
+   164→   164→  const imgRefs = useRef<Map<number, HTMLImageElement>>(new Map());
+   165→   165→
+   166→   166→  // Init
+   167→   167→  useEffect(() => {
+   168→   168→    setHistory(getHistory());
+   169→   169→    getAllOffline().then(setOfflineChapters).catch(() => {});
+   170→   170→    const saved = getLastRead();
+   171→   171→    if (saved) setUrl(saved);
+   172→   172→  }, []);
+   173→   173→
+   174→   174→  // Scroll listener
+   175→   175→  useEffect(() => {
+   176→   176→    const el = scrollRef.current;
+   177→   177→    if (!el) return;
+   178→   178→    const onScroll = () => {
+   179→   179→      setShowScrollTop(el.scrollTop > 600);
+   180→   180→      // Track which page we're viewing
+   181→   181→      const imgs = el.querySelectorAll("img");
+   182→   182→      for (let i = 0; i < imgs.length; i++) {
+   183→   183→        const rect = imgs[i].getBoundingClientRect();
+   184→   184→        if (rect.top >= -rect.height / 2) {
+   185→   185→          setCurrentPage(i + 1);
+   186→   186→          break;
+   187→   187→        }
+   188→   188→      }
+   189→   189→    };
+   190→   190→    el.addEventListener("scroll", onScroll, { passive: true });
+   191→   191→    return () => el.removeEventListener("scroll", onScroll);
+   192→   192→  }, [data]);
+   193→   193→
+   194→   194→  // Set initial page to 1 when data loads
+   195→   195→  useEffect(() => { if (data?.images.length) setCurrentPage(1); }, [data?.images.length]);
+   196→   196→
+   197→   197→  // Keyboard shortcuts
+   198→   198→  useEffect(() => {
+   199→   199→    const handler = (e: KeyboardEvent) => {
+   200→   200→      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+   201→   201→      if (e.key === "ArrowLeft" && data?.prevUrl) {
+   202→   202→        e.preventDefault();
+   203→   203→        goToChapter(data.prevUrl);
+   204→   204→      } else if (e.key === "ArrowRight" && data?.nextUrl) {
+   205→   205→        e.preventDefault();
+   206→   206→        goToChapter(data.nextUrl);
+   207→   207→      } else if (e.key === "t" || e.key === "T") {
+   208→   208→        toggleTheme();
+   209→   209→      } else if (e.key === "l" || e.key === "L") {
+   210→   210→        setShowChapters((v) => !v);
+   211→   211→      } else if (e.key === "Escape") {
+   212→   212→        setShowChapters(false);
+   213→   213→        setShowSearch(false);
+   214→   214→        setShowHistory(false);
+   215→   215→        setShowOffline(false);
+   216→   216→        setShowPageJumper(false);
+   217→   217→        setShowMobileMenu(false);
+   218→   218→      } else if (e.key === "g" || e.key === "G") {
+   219→   219→        setShowPageJumper((v) => !v);
+   220→   220→      }
+   221→   221→    };
+   222→   222→    window.addEventListener("keydown", handler);
+   223→   223→    return () => window.removeEventListener("keydown", handler);
+   224→   224→  }, [data]);
+   225→   225→
+   226→   226→  const handleImageLoad = useCallback((index: number) => {
+   227→   227→    setLoadedImages((prev) => new Set(prev).add(index));
+   228→   228→  }, []);
+   229→   229→
+   230→   230→  const loadChapter = useCallback(async (chapterUrl: string, offline?: OfflineChapter) => {
+   231→   231→    if (!chapterUrl.trim()) return;
+   232→   232→    setLoading(true);
+   233→   233→    setError("");
+   234→   234→    setData(null);
+   235→   235→    setLoadedImages(new Set());
+   236→   236→    setCurrentPage(0);
+   237→   237→    setShowScrollTop(false);
+   238→   238→    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+   239→   239→    setUrl(chapterUrl);
+   240→   240→    setLastRead(chapterUrl);
+   241→   241→    setShowChapters(false);
+   242→   242→    setShowMobileMenu(false);
+   243→   243→
+   244→   244→    try {
+   245→   245→      if (offline) {
+   246→   246→        // Load from offline cache
+   247→   247→        const chapterData: ChapterData = {
+   248→   248→          title: `${offline.mangaName}, Chapter ${offline.chapterNum}`,
+   249→   249→          images: offline.images,
+   250→   250→          prevUrl: null,
+   251→   251→          nextUrl: null,
+   252→   252→          mangaName: offline.mangaName,
+   253→   253→          chapterNum: offline.chapterNum,
+   254→   254→          seriesSlug: "",
+   255→   255→          warning: "Offline mode — navigation disabled",
+   256→   256→        };
+   257→   257→        setData(chapterData);
+   258→   258→        setIsOfflineMode(true);
+   259→   259→      } else {
+   260→   260→        setIsOfflineMode(false);
+   261→   261→        const res = await fetch("/api/scrape", {
+   262→   262→          method: "POST",
+   263→   263→          headers: { "Content-Type": "application/json" },
+   264→   264→          body: JSON.stringify({ url: chapterUrl }),
+   265→   265→        });
+   266→   266→        const json = await res.json();
+   267→   267→        if (!res.ok) throw new Error(json.error || "Failed to load chapter");
+   268→   268→        setData(json);
+   269→   269→        saveHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() });
+   270→   270→        setHistory(getHistory());
+   271→   271→
+   272→   272→        // Fetch chapter list in background
+   273→   273→        if (json.seriesSlug) fetchChapterList(chapterUrl);
+   274→   274→      }
+   275→   275→    } catch (err) {
+   276→   276→      setError(err instanceof Error ? err.message : "Something went wrong");
+   277→   277→    } finally {
+   278→   278→      setLoading(false);
+   279→   279→    }
+   280→   280→  }, []);
+   281→   281→
+   282→   282→  const fetchChapterList = async (chapterUrl: string) => {
+   283→   283→    setChaptersLoading(true);
+   284→   284→    try {
+   285→   285→      const res = await fetch("/api/chapters", {
+   286→   286→        method: "POST",
+   287→   287→        headers: { "Content-Type": "application/json" },
+   288→   288→        body: JSON.stringify({ url: chapterUrl }),
+   289→   289→      });
+   290→   290→      const json = await res.json();
+   291→   291→      if (res.ok) setChapters(json.chapters || []);
+   292→   292→    } catch {
+   293→   293→      // Silent fail for chapter list
+   294→   294→    } finally {
+   295→   295→      setChaptersLoading(false);
+   296→   296→    }
+   297→   297→  };
+   298→   298→
+   299→   299→  const handleSearch = async () => {
+   300→   300→    if (!searchQuery.trim()) return;
+   301→   301→    setSearchLoading(true);
+   302→   302→    try {
+   303→   303→      const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+   304→   304→      const json = await res.json();
+   305→   305→      if (res.ok) setSearchResults(json);
+   306→   306→    } catch { /* ignore */ }
+   307→   307→    finally { setSearchLoading(false); }
+   308→   308→  };
+   309→   309→
+   310→   310→  const handleSaveOffline = async () => {
+   311→   311→    if (!data || data.images.length === 0) return;
+   312→   312→    setSavingOffline(true);
+   313→   313→    try {
+   314→   314→      // Pre-fetch all images through proxy to cache them
+   315→   315→      const imageUrls = data.images.map(PROXY);
+   316→   316→      await saveOffline({
+   317→   317→        url,
+   318→   318→        mangaName: data.mangaName,
+   319→   319→        chapterNum: data.chapterNum,
+   320→   320→        images: imageUrls,
+   321→   321→        savedAt: Date.now(),
+   322→   322→      });
+   323→   323→      const updated = await getAllOffline();
+   324→   324→      setOfflineChapters(updated);
+   325→   325→    } catch { /* ignore */ }
+   326→   326→    finally { setSavingOffline(false); }
+   327→   327→  };
+   328→   328→
+   329→   329→  const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); loadChapter(url); };
+   330→   330→  const goToChapter = (chapterUrl: string | null) => { if (chapterUrl) loadChapter(chapterUrl); };
+   331→   331→  const scrollToTop = () => scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+   332→   332→  const toggleTheme = () => {
+   333→   333→    const next = theme === "dark" ? "light" : "dark";
+   334→   334→    setTheme(next);
+   335→   335→    localStorage.setItem("manga-theme", next);
+   336→   336→  };
+   337→   337→
+   338→   338→  const jumpToPage = (page: number) => {
+   339→   339→    const img = imgRefs.current.get(page - 1);
+   340→   340→    if (img) img.scrollIntoView({ behavior: "smooth", block: "start" });
+   341→   341→    setShowPageJumper(false);
+   342→   342→    setPageInput("");
+   343→   343→  };
+   344→   344→
+   345→   345→  const totalPages = data?.images.length || 0;
+   346→   346→  const displayImages = data ? data.images.map(PROXY) : [];
+   347→   347→  const isDark = theme === "dark";
+   348→   348→
+   349→   349→  const bg = isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]";
+   350→   350→  const textCol = isDark ? "text-white" : "text-gray-900";
+   351→   351→  const subText = isDark ? "text-white/50" : "text-gray-500";
+   352→   352→  const barBg = isDark ? "bg-[#111] border-white/10" : "bg-white border-gray-200";
+   353→   353→  const panelBg = isDark ? "bg-[#111]" : "bg-white";
+   354→   354→  const hoverBg = isDark ? "hover:bg-white/10" : "hover:bg-gray-100";
+   355→   355→
+   356→   356→  const imgStyle: React.CSSProperties =
+   357→   357→    fitMode === "width" ? { width: "100%", height: "auto" }
+   358→   358→    : fitMode === "height" ? { height: "100vh", width: "auto", margin: "0 auto" }
+   359→   359→    : { maxWidth: "100%", height: "auto", margin: "0 auto" };
+   360→   360→
+   361→   361→  // ─── Sidebar panel component ─────────────────────
+   362→   362→  const SidePanel = ({ title, icon, show, onClose, children }: {
+   363→   363→    title: string; icon: React.ReactNode; show: boolean; onClose: () => void; children: React.ReactNode;
+   364→   364→  }) => {
+   365→   365→    if (!show) return null;
+   366→   366→    return (
+   367→   367→      <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
+   368→   368→        <div className="absolute inset-0 bg-black/50" />
+   369→   369→        <div className={`relative w-full max-w-sm ${panelBg} ${textCol} shadow-2xl flex flex-col`} style={{animation: "slideIn 200ms ease-out"}} onClick={(e) => e.stopPropagation()}>
+   370→   370→          <div className={`flex items-center justify-between px-4 py-3 border-b ${isDark ? "border-white/10" : "border-gray-200"}`}>
+   371→   371→            <div className="flex items-center gap-2">
+   372→   372→              {icon}
+   373→   373→              <h2 className="font-semibold text-sm">{title}</h2>
+   374→   374→            </div>
+   375→   375→            <button onClick={onClose} className={`p-1 rounded ${hoverBg}`}><X className="h-4 w-4" /></button>
+   376→   376→          </div>
+   377→   377→          <ScrollArea className="flex-1">{children}</ScrollArea>
+   378→   378→        </div>
+   379→   379→      </div>
+   380→   380→    );
+   381→   381→  };
+   382→   382→
+   383→   383→  // ─── Loading ────────────────────────────────────────
+   384→   384→  if (loading) {
+   385→   385→    return (
+   386→   386→      <div className="min-h-screen flex flex-col items-center justify-center gap-4 p-6 bg-[#0a0a0a]">
+   387→   387→        <Loader2 className="h-10 w-10 animate-spin text-white/60" />
+   388→   388→        <p className="text-white/60 text-sm">Loading chapter…</p>
+   389→   389→      </div>
+   390→   390→    );
+   391→   391→  }
+   392→   392→
+   393→   393→  // ─── Landing ────────────────────────────────────────
+   394→   394→  if (!data && !error) {
+   395→   395→    return (
+   396→   396→      <div className="min-h-screen flex flex-col bg-[#0a0a0a]">
+   397→   397→        {/* Header */}
+   398→   398→        <header className={`border-b px-6 py-4 flex items-center justify-between ${isDark ? "border-white/10" : "border-gray-200"} ${panelBg}`}>
+   399→   399→          <div className="flex items-center gap-3">
+   400→   400→            <BookOpen className="h-6 w-6 text-white" />
+   401→   401→            <h1 className="text-xl font-bold text-white">Manga Reader</h1>
+   402→   402→          </div>
+   403→   403→          <div className="flex items-center gap-2">
+   404→   404→            <button onClick={() => setShowSearch(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="Search manga"><Search className="h-5 w-5" /></button>
+   405→   405→            <button onClick={() => setShowHistory(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="History"><History className="h-5 w-5" /></button>
+   406→   406→            <button onClick={() => setShowOffline(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="Offline"><Download className="h-5 w-5" /></button>
+   407→   407→            <button onClick={toggleTheme} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`}><Sun className="h-5 w-5" /></button>
+   408→   408→          </div>
+   409→   409→        </header>
+   410→   410→
+   411→   411→        {/* Main */}
+   412→   412→        <main className="flex-1 flex flex-col items-center justify-center gap-8 p-6">
+   413→   413→          <div className="text-center max-w-lg">
+   414→   414→            <h2 className="text-2xl font-bold text-white mb-2">Read manga, ad-free</h2>
+   415→   415→            <p className="text-white/50 text-sm">Paste a mangafragrant.com chapter URL, pick from your history, or search for a manga.</p>
+   416→   416→          </div>
+   417→   417→
+   418→   418→          <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
+   419→   419→            <Input type="url" placeholder="https://www.mangafragrant.com/manga/..." value={url} onChange={(e) => setUrl(e.target.value)}
+   420→   420→              className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+   421→   421→            <Button type="submit">Read</Button>
+   422→   422→          </form>
+   423→   423→
+   424→   424→          {/* Recent History */}
+   425→   425→          {history.length > 0 && (
+   426→   426→            <div className="w-full max-w-lg">
+   427→   427→              <h3 className={`text-xs font-semibold uppercase tracking-wider mb-3 ${subText}`}>Recent</h3>
+   428→   428→              <div className="space-y-1">
+   429→   429→                {history.slice(0, 5).map((h) => (
+   430→   430→                  <button key={h.url} onClick={() => loadChapter(h.url)}
+   431→   431→                    className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${isDark ? "hover:bg-white/5 text-white/70" : "hover:bg-gray-100 text-gray-600"}`}>
+   432→   432→                    <span className="font-medium">{h.mangaName}</span>
+   433→   433→                    {h.chapterNum && <span className={subText}> · Ch {h.chapterNum}</span>}
+   434→   434→                  </button>
+   435→   435→                ))}
+   436→   436→              </div>
+   437→   437→            </div>
+   438→   438→          )}
+   439→   439→
+   440→   440→          {/* Keyboard shortcuts hint */}
+   441→   441→          <div className={`text-xs ${subText} text-center space-y-1`}>
+   442→   442→            <p>Keyboard shortcuts: <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">←</kbd> <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">→</kbd> chapters · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">T</kbd> theme · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">L</kbd> chapter list</p>
+   443→   443→          </div>
+   444→   444→        </main>
+   445→   445→
+   446→   446→        {/* Side panels */}
+   447→   447→        <SidePanel title="Search Manga" icon={<Search className="h-4 w-4" />} show={showSearch} onClose={() => setShowSearch(false)}>
+   448→   448→          <div className="p-4 space-y-3">
+   449→   449→            <div className="flex gap-2">
+   450→   450→              <Input placeholder="Search…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+   451→   451→                onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+   452→   452→                className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+   453→   453→              <Button size="sm" onClick={handleSearch} disabled={searchLoading}>Go</Button>
+   454→   454→            </div>
+   455→   455→            {searchLoading && <div className="flex justify-center py-4"><Loader2 className="h-5 w-5 animate-spin" /></div>}
+   456→   456→            <div className="space-y-1">
+   457→   457→              {searchResults.map((r, i) => (
+   458→   458→                <button key={i} onClick={() => { loadChapter(r.url); setShowSearch(false); }}
+   459→   459→                  className="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-white/5 text-white/80">
+   460→   460→                  <div className="font-medium">{r.title}</div>
+   461→   461→                  {r.latestChapter && <div className="text-xs text-white/40">{r.latestChapter}</div>}
+   462→   462→                </button>
+   463→   463→              ))}
+   464→   464→            </div>
+   465→   465→          </div>
+   466→   466→        </SidePanel>
+   467→   467→
+   468→   468→        <SidePanel title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
+   469→   469→          <div className="p-4 space-y-1">
+   470→   470→            {history.length === 0 && <p className="text-white/40 text-sm">No history yet</p>}
+   471→   471→            {history.map((h) => (
+   472→   472→              <button key={h.url} onClick={() => { loadChapter(h.url); setShowHistory(false); }}
+   473→   473→                className="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-white/5 text-white/80">
+   474→   474→                <div className="font-medium">{h.mangaName}</div>
+   475→   475→                <div className="text-xs text-white/40">Ch {h.chapterNum} · {new Date(h.timestamp).toLocaleDateString()}</div>
+   476→   476→              </button>
+   477→   477→            ))}
+   478→   478→          </div>
+   479→   479→        </SidePanel>
+   480→   480→
+   481→   481→        <SidePanel title="Offline Library" icon={<Download className="h-4 w-4" />} show={showOffline} onClose={() => setShowOffline(false)}>
+   482→   482→          <div className="p-4 space-y-1">
+   483→   483→            {offlineChapters.length === 0 && <p className="text-white/40 text-sm">No saved chapters</p>}
+   484→   484→            {offlineChapters.map((o) => (
+   485→   485→              <div key={o.url} className="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-white/5">
+   486→   486→                <button onClick={() => { loadChapter(o.url, o); setShowOffline(false); }} className="text-left text-sm text-white/80">
+   487→   487→                  <div className="font-medium">{o.mangaName}</div>
+   488→   488→                  <div className="text-xs text-white/40">Ch {o.chapterNum} · {o.images.length} pages</div>
+   489→   489→                </button>
+   490→   490→                <button onClick={() => { deleteOffline(o.url); getAllOffline().then(setOfflineChapters); }}
+   491→   491→                  className="text-white/30 hover:text-red-400 p-1"><X className="h-3 w-3" /></button>
+   492→   492→              </div>
+   493→   493→            ))}
+   494→   494→          </div>
+   495→   495→        </SidePanel>
+   496→   496→      </div>
+   497→   497→    );
+   498→   498→  }
+   499→   499→
+   500→   500→  // ─── Error ──────────────────────────────────────────
+   501→   501→  if (error) {
+   502→   502→    return (
+   503→   503→      <div className="min-h-screen flex flex-col items-center justify-center gap-6 p-6 bg-[#0a0a0a]">
+   504→   504→        <p className="text-red-400 text-sm max-w-md text-center">{error}</p>
+   505→   505→        <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
+   506→   506→          <Input type="url" placeholder="Try a different URL…" value={url} onChange={(e) => setUrl(e.target.value)}
+   507→   507→            className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+   508→   508→          <Button type="submit">Retry</Button>
+   509→   509→        </form>
+   510→   510→        {data?.prevUrl && <Button variant="outline" onClick={() => goToChapter(data.prevUrl)}><ChevronLeft className="h-4 w-4 mr-1" /> Previous Chapter</Button>}
+   511→   511→      </div>
+   512→   512→    );
+   513→   513→  }
+   514→   514→
+   515→   515→  // ─── Reader ─────────────────────────────────────────
+   516→   516→  return (
+   517→   517→    <div className={`h-screen flex flex-col ${bg} ${textCol} overflow-hidden`}>
+   518→   518→      {/* Top bar */}
+   519→   519→      <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg} z-40`}>
+   520→   520→        <button onClick={() => setShowMobileMenu((v) => !v)} className={`p-1.5 rounded sm:hidden ${hoverBg}`}><Menu className="h-5 w-5" /></button>
+   521→   521→        <div className="flex items-center gap-2 min-w-0 flex-1">
+   522→   522→          <BookOpen className="h-4 w-4 shrink-0" />
+   523→   523→          <h1 className="text-sm font-semibold truncate">{data.mangaName}</h1>
+   524→   524→          {data.chapterNum && <span className={subText}>· Ch {data.chapterNum}</span>}
+   525→   525→          {isOfflineMode && <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">OFFLINE</span>}
+   526→   526→        </div>
+   527→   527→
+   528→   528→        {/* Desktop buttons */}
+   529→   529→        <div className="hidden sm:flex items-center gap-1">
+   530→   530→          <button onClick={() => setShowChapters((v) => !v)} className={`px-2 py-1 rounded text-xs transition-colors ${showChapters ? "bg-white/15" : ""} ${subText} ${hoverBg}`} title="Chapter list (L)"><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
+   531→   531→          <div className="w-px h-4 bg-white/10 mx-1" />
+   532→   532→          {(["width", "height", "original"] as const).map((fm) => (
+   533→   533→            <button key={fm} onClick={() => setFitMode(fm)}
+   534→   534→              className={`px-2 py-1 rounded text-xs transition-colors ${fitMode === fm ? "bg-white/15" : ""} ${subText} ${hoverBg}`}>
+   535→   535→              {fm === "width" ? "Fit W" : fm === "height" ? "Fit H" : "1:1"}
+   536→   536→            </button>
+   537→   537→          ))}
+   538→   538→          <div className="w-px h-4 bg-white/10 mx-1" />
+   539→   539→          <button onClick={() => setShowPageJumper((v) => !v)} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`} title="Jump to page (G)">
+   540→   540→            {currentPage}/{totalPages}
+   541→   541→          </button>
+   542→   542→          <button onClick={handleSaveOffline} disabled={savingOffline} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`} title="Save offline">
+   543→   543→            {savingOffline ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+   544→   544→          </button>
+   545→   545→          <button onClick={toggleTheme} className={`p-1.5 rounded ${hoverBg} ${subText}`}><Sun className="h-4 w-4" /></button>
+   546→   546→        </div>
+   547→   547→      </header>
+   548→   548→
+   549→   549→      {/* Mobile dropdown menu */}
+   550→   550→      {showMobileMenu && (
+   551→   551→        <div className={`sm:hidden border-b px-3 py-3 flex flex-wrap gap-2 ${barBg} z-30`}>
+   552→   552→          <button onClick={() => { setShowChapters((v) => !v); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
+   553→   553→          {(["width", "height", "original"] as const).map((fm) => (
+   554→   554→            <button key={fm} onClick={() => { setFitMode(fm); setShowMobileMenu(false); }}
+   555→   555→              className={`px-3 py-1.5 rounded text-xs ${fitMode === fm ? "bg-white/15" : ""} ${hoverBg}`}>
+   556→   556→              {fm === "width" ? "Fit Width" : fm === "height" ? "Fit Height" : "Original"}
+   557→   557→            </button>
+   558→   558→          ))}
+   559→   559→          <button onClick={() => { setShowPageJumper((v) => !v); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>Page {currentPage}/{totalPages}</button>
+   560→   560→          <button onClick={() => { handleSaveOffline(); setShowMobileMenu(false); }} disabled={savingOffline} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
+   561→   561→            {savingOffline ? "Saving…" : <><Download className="h-3.5 w-3.5 inline mr-1" />Save</>}
+   562→   562→          </button>
+   563→   563→          <button onClick={() => { toggleTheme(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
+   564→   564→            {isDark ? <Sun className="h-3.5 w-3.5 inline mr-1" /> : <Moon className="h-3.5 w-3.5 inline mr-1" />}Theme
+   565→   565→          </button>
+   566→   566→        </div>
+   567→   567→      )}
+   568→   568→
+   569→   569→      {/* Page jumper overlay */}
+   570→   570→      {showPageJumper && (
+   571→   571→        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 p-3 rounded-lg shadow-xl border"
+   572→   572→          style={{ backgroundColor: isDark ? "#1a1a1a" : "#fff", borderColor: isDark ? "rgba(255,255,255,0.1)" : "#e5e5e5" }}>
+   573→   573→          <span className={`text-xs ${subText}`}>Jump to:</span>
+   574→   574→          <input type="number" min={1} max={totalPages} value={pageInput}
+   575→   575→            onChange={(e) => setPageInput(e.target.value)}
+   576→   576→            onKeyDown={(e) => { if (e.key === "Enter") jumpToPage(parseInt(pageInput)); }}
+   577→   577→            placeholder={`1-${totalPages}`}
+   578→   578→            className={`w-20 px-2 py-1 rounded text-sm ${isDark ? "bg-white/10 text-white" : "bg-gray-100 text-gray-900"}`}
+   579→   579→            autoFocus />
+   580→   580→          <Button size="sm" onClick={() => jumpToPage(parseInt(pageInput))} disabled={!pageInput}>Go</Button>
+   581→   581→        </div>
+   582→   582→      )}
+   583→   583→
+   584→   584→      {/* Chapter sidebar */}
+   585→   585→      <SidePanel title={`Chapters (${chapters.length})`} icon={<List className="h-4 w-4" />} show={showChapters} onClose={() => setShowChapters(false)}>
+   586→   586→        <div className="p-3">
+   587→   587→          {chaptersLoading && <div className="flex justify-center py-8"><Loader2 className="h-5 w-5 animate-spin" /></div>}
+   588→   588→          {chapters.length === 0 && !chaptersLoading && <p className="text-white/40 text-sm text-center py-8">Load a chapter first to see the list</p>}
+   589→   589→          <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
+   590→   590→            {chapters.map((ch) => {
+   591→   591→              const isCurrent = ch.num === parseInt(data.chapterNum);
+   592→   592→              return (
+   593→   593→                <button key={ch.num} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
+   594→   594→                  className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
+   595→   595→                    ? "bg-white/15 font-semibold"
+   596→   596→                    : hoverBg
+   597→   597→                  } ${isCurrent ? textCol : subText}`}>
+   598→   598→                  Chapter {ch.num}
+   599→   599→                </button>
+   600→   600→              );
+   601→   601→            })}
+   602→   602→          </div>
+   603→   603→        </div>
+   604→   604→      </SidePanel>
+   605→   605→
+   606→   606→      {/* Image area */}
+   607→   607→      <div ref={scrollRef} className="flex-1 overflow-y-auto relative">
+   608→   608→        {data.warning && (
+   609→   609→          <div className="max-w-2xl mx-auto mt-6 px-4">
+   610→   610→            <div className={`rounded-lg border p-4 text-sm ${isDark ? "bg-yellow-900/20 border-yellow-800 text-yellow-300" : "bg-yellow-50 border-yellow-200 text-yellow-700"}`}>
+   611→   611→              {data.warning}
+   612→   612→            </div>
+   613→   613→          </div>
+   614→   614→        )}
+   615→   615→        <div className="flex flex-col items-center">
+   616→   616→          {displayImages.map((src, i) => (
+   617→   617→            <div key={i} className="relative w-full" style={i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : undefined}>
+   618→   618→              {!loadedImages.has(i) && (
+   619→   619→                <Skeleton className="w-full mx-auto" style={{ aspectRatio: "2/3", maxWidth: "800px" }} />
+   620→   620→              )}
+   621→   621→              <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
+   622→   622→                src={src} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
+   623→   623→                style={{ ...imgStyle, display: loadedImages.has(i) ? "block" : "none" }}
+   624→   624→                loading="eager" />
+   625→   625→            </div>
+   626→   626→          ))}
+   627→   627→        </div>
+   628→   628→        <div className="h-20" />
+   629→   629→      </div>
+   630→   630→
+   631→   631→      {/* Bottom nav */}
+   632→   632→      <nav className={`shrink-0 border-t px-4 py-2 flex items-center justify-between ${barBg} z-40`}>
+   633→   633→        <Button variant="ghost" size="sm" disabled={!data.prevUrl} onClick={() => goToChapter(data.prevUrl)}>
+   634→   634→          <ChevronLeft className="h-4 w-4 mr-1" /><span className="hidden sm:inline">Prev</span>
+   635→   635→        </Button>
+   636→   636→
+   637→   637→        <div className="flex items-center gap-2">
+   638→   638→          <button onClick={() => setShowPageJumper(true)} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`}>
+   639→   639→            {currentPage}/{totalPages}
+   640→   640→          </button>
+   641→   641→        </div>
+   642→   642→
+   643→   643→        <Button variant="ghost" size="sm" disabled={!data.nextUrl} onClick={() => goToChapter(data.nextUrl)}>
+   644→   644→          <span className="hidden sm:inline">Next</span><ChevronRight className="h-4 w-4 ml-1" />
+   645→   645→        </Button>
+   646→   646→      </nav>
+   647→   647→
+   648→   648→      {/* Scroll to top */}
+   649→   649→      {showScrollTop && (
+   650→   650→        <button onClick={scrollToTop}
+   651→   651→          className={`fixed bottom-20 right-4 p-2.5 rounded-full shadow-lg transition-all z-30 ${isDark ? "bg-white/10 hover:bg-white/20 text-white" : "bg-white hover:bg-gray-100 text-gray-900 border"}`}
+   652→   652→          aria-label="Scroll to top"><ArrowUp className="h-5 w-5" /></button>
+   653→   653→      )}
+   654→   654→    </div>
+   655→   655→  );
+   656→   656→}
