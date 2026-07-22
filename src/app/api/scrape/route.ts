@@ -10,6 +10,7 @@ interface ChapterData {
   nextUrl: string | null;
   mangaName: string;
   chapterNum: string;
+  seriesSlug: string;
   warning?: string;
 }
 
@@ -18,7 +19,6 @@ function extractImages(html: string): string[] {
   const srcRe = /<img[^>]+src=["']([^"']+)["']/gi;
   let m: RegExpExecArray | null;
   while ((m = srcRe.exec(html)) !== null) imgs.push(m[1]);
-
   const lazyRe = /data-(?:src|lazy-src|original|image-url)=["']([^"']+)["']/gi;
   while ((m = lazyRe.exec(html)) !== null) imgs.push(m[1]);
 
@@ -29,8 +29,6 @@ function extractImages(html: string): string[] {
     if (!clean || seen.has(clean)) continue;
     if (!/\.(jpe?g|png|webp|gif|avif)/i.test(clean)) continue;
     if (/(?:icon|logo|emoji|avatar|button|banner|ads?|popup|1x1|tracking|pixel|w\.org|gravatar|pinterest)/i.test(clean)) continue;
-    // Must be a manga image — large, hosted on CDN, contains "chapter" or numeric path pattern
-    // Filter: keep images that look like manga pages (hosted on storage/CDN, not tiny UI elements)
     seen.add(clean);
     unique.push(clean);
   }
@@ -40,27 +38,28 @@ function extractImages(html: string): string[] {
 function extractNavLinks(html: string): { prev: string | null; next: string | null } {
   let prev: string | null = null;
   let next: string | null = null;
-
   const prevMatch = /<a[^>]+href=["']([^"']+)["'][^>]*rel=["']prev["']/i.exec(html)
     || /<a[^>]+rel=["']prev["'][^>]+href=["']([^"']+)["']/i.exec(html);
   if (prevMatch) prev = prevMatch[1].replace(/&amp;/g, "&");
-
   const nextMatch = /<a[^>]+href=["']([^"']+)["'][^>]*rel=["']next["']/i.exec(html)
     || /<a[^>]+rel=["']next["'][^>]+href=["']([^"']+)["']/i.exec(html);
   if (nextMatch) next = nextMatch[1].replace(/&amp;/g, "&");
-
   return { prev, next };
 }
 
 function extractTitle(html: string): { mangaName: string; chapterNum: string; fullTitle: string } {
   const titleMatch = /<title>([^<]+)<\/title>/i.exec(html);
   const raw = titleMatch?.[1] || "Unknown Manga";
-
   const chapMatch = /chapter\s*(\d+)/i.exec(raw);
   const chapterNum = chapMatch ? chapMatch[1] : "";
   const mangaName = raw.replace(/,\s*Chapter\s*\d+.*$/i, "").replace(/\s*-\s*Manga\s*Online.*$/i, "").trim();
-
   return { mangaName, chapterNum, fullTitle: raw };
+}
+
+// Derive series slug: "the-fragrant-flower-blooms-with-dignity-chapter-182" -> "the-fragrant-flower-blooms-with-dignity"
+function extractSeriesSlug(url: string): string {
+  const m = url.match(/manga\/(.+?)-chapter-\d+/i);
+  return m ? m[1] : "";
 }
 
 async function scrapeChapter(url: string): Promise<ChapterData> {
@@ -80,33 +79,16 @@ async function scrapeChapter(url: string): Promise<ChapterData> {
   if (!resp.ok) throw new Error(`Failed to fetch page: ${resp.status}`);
   const html = await resp.text();
 
-  // Extract images from the full HTML — mangafragrant uses plain <img src> inside <p> tags
-  // within .entry-content, but the regex-safe approach is to scan everything and filter
   const allImages = extractImages(html);
-
-  // Filter to only keep actual manga page images (from contabostorage or similar CDN,
-  // with chapter-based paths and sequential numbering)
-  const mangaImages = allImages.filter((u) => {
-    // Keep CDN-hosted images that look like manga pages
-    if (/contabostorage\.com/i.test(u)) return true;
-    // Keep images with /Chapter N/ or /chapter-n/ in path
-    if (/chapter\s*\d+/i.test(u)) return true;
-    // Keep large images from any CDN (not tiny UI assets)
-    // For mangafragrant specifically, all manga images come from contabostorage
-    return false;
-  });
+  const mangaImages = allImages.filter((u) =>
+    /contabostorage\.com/i.test(u) || /chapter\s*\d+/i.test(u)
+  );
 
   const { prev, next } = extractNavLinks(html);
   const { mangaName, chapterNum, fullTitle } = extractTitle(html);
+  const seriesSlug = extractSeriesSlug(url);
 
-  const data: ChapterData = {
-    title: fullTitle,
-    images: mangaImages,
-    prevUrl: prev,
-    nextUrl: next,
-    mangaName,
-    chapterNum,
-  };
+  const data: ChapterData = { title: fullTitle, images: mangaImages, prevUrl: prev, nextUrl: next, mangaName, chapterNum, seriesSlug };
   if (mangaImages.length === 0) data.warning = "No images found. This chapter may not be available yet.";
 
   CACHE.set(url, { data, ts: Date.now() });
@@ -118,7 +100,6 @@ export async function POST(req: NextRequest) {
     const { url } = await req.json();
     if (!url || typeof url !== "string") return NextResponse.json({ error: "URL is required" }, { status: 400 });
     try { new URL(url); } catch { return NextResponse.json({ error: "Invalid URL format" }, { status: 400 }); }
-
     const data = await scrapeChapter(url);
     return NextResponse.json(data);
   } catch (err) {
