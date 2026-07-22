@@ -16,7 +16,7 @@ Ad-free manga reader. Paste a chapter URL from mangafragrant.com and read clean.
 
 ## Deploy to Vercel
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=GITHUB_REPO_URL_HERE)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/CloudCompile/manga-reader)
 
 ## Run Locally
 
