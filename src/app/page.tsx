@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,6 +18,8 @@ import {
   X,
   History,
   Menu,
+  Layers,
+  Library,
 } from "lucide-react";
 import {
   getHistory,
@@ -46,6 +48,7 @@ interface ChapterItem {
   num: number;
   url: string;
   title: string;
+  volume?: string;
 }
 
 interface SearchResult {
@@ -55,8 +58,19 @@ interface SearchResult {
   source?: string;
 }
 
+interface TitleItem {
+  title: string;
+  url: string;
+  sourceId: string;
+  sourceName: string;
+  latestChapter: string;
+  totalChapters: number;
+  thumbnail?: string;
+}
+
 type Theme = "dark" | "light";
 type FitMode = "width" | "height" | "original";
+type GroupMode = "chapter" | "volume";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
@@ -71,12 +85,19 @@ export default function MangaReader() {
   const [fitMode, setFitMode] = useState<FitMode>("width");
   const [loadedImages, setLoadedImages] = useState<Set<number>>(new Set());
   const [chapters, setChapters] = useState<ChapterItem[]>([]);
+  const [volumes, setVolumes] = useState<string[]>([]);
+  const [groupMode, setGroupMode] = useState<GroupMode>("chapter");
   const [chaptersLoading, setChaptersLoading] = useState(false);
   const [showChapters, setShowChapters] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
+  const [titles, setTitles] = useState<TitleItem[]>([]);
+  const [titlesLoading, setTitlesLoading] = useState(true);
+  const [titlesError, setTitlesError] = useState("");
+  const [titleQuery, setTitleQuery] = useState("");
+  const [titleSource, setTitleSource] = useState("all");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [currentPage, setCurrentPage] = useState(0);
@@ -93,6 +114,28 @@ export default function MangaReader() {
     const saved = getLastRead();
     if (saved) setUrl(saved);
     setTheme(getTheme());
+  }, []);
+
+  // Title listing for the browse grid
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      setTitlesLoading(true);
+      setTitlesError("");
+      try {
+        const res = await fetch("/api/titles");
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error || "Failed to load titles");
+        if (active) setTitles(json);
+      } catch (err) {
+        if (active) setTitlesError(err instanceof Error ? err.message : "Failed to load titles");
+      } finally {
+        if (active) setTitlesLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Scroll listener
@@ -195,13 +238,51 @@ export default function MangaReader() {
         body: JSON.stringify({ url: chapterUrl }),
       });
       const json = await res.json();
-      if (res.ok) setChapters(json.chapters || []);
+      if (res.ok) {
+        setChapters(json.chapters || []);
+        setVolumes(json.volumes || []);
+      }
     } catch {
       // Silent fail for chapter list
     } finally {
       setChaptersLoading(false);
     }
   };
+
+  // A title's url is a series page or its latest chapter. Resolve it to a
+  // chapter that actually has images, since the newest chapter is sometimes an
+  // empty placeholder ("coming soon").
+  const openTitle = useCallback(async (title: TitleItem) => {
+    try {
+      const res = await fetch("/api/chapters", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: title.url }),
+      });
+      const json = await res.json();
+      const list: ChapterItem[] = json.chapters || [];
+      if (!res.ok || !list.length) {
+        setError("No readable chapters found for this title yet.");
+        return;
+      }
+
+      for (const candidate of list.slice(0, 3)) {
+        const sres = await fetch("/api/scrape", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: candidate.url }),
+        });
+        const scraped = await sres.json();
+        if (sres.ok && (scraped.images || []).length) {
+          loadChapter(candidate.url);
+          return;
+        }
+      }
+      loadChapter(list[0].url);
+    } catch {
+      setError("Could not open this title.");
+    }
+  }, []);
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
@@ -233,6 +314,42 @@ export default function MangaReader() {
   const totalPages = data?.images.length || 0;
   const displayImages = data ? data.images.map(PROXY) : [];
   const isDark = theme === "dark";
+
+  // Distinct sources in the listing, ordered with the single-series hosts first.
+  const sourceOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const t of titles) if (!seen.has(t.sourceId)) seen.set(t.sourceId, t.sourceName);
+    return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
+  }, [titles]);
+
+  const visibleTitles = useMemo(() => {
+    const q = titleQuery.trim().toLowerCase();
+    return titles.filter(
+      (t) =>
+        (titleSource === "all" || t.sourceId === titleSource) &&
+        (!q || t.title.toLowerCase().includes(q))
+    );
+  }, [titles, titleQuery, titleSource]);
+
+  const canGroupByVolume = volumes.length > 1;
+
+  // Chapters bucketed by volume; unnumbered gaps collect under "Other".
+  const volumeGroups = useMemo(() => {
+    if (!canGroupByVolume) return [];
+    const groups = new Map<string, ChapterItem[]>();
+    for (const ch of chapters) {
+      const key = ch.volume || "Other";
+      const bucket = groups.get(key);
+      if (bucket) bucket.push(ch);
+      else groups.set(key, [ch]);
+    }
+    const ordered = Array.from(groups.entries())
+      .filter(([k]) => k !== "Other")
+      .sort((a, b) => Number(b[0]) - Number(a[0]));
+    const other = groups.get("Other");
+    if (other) ordered.push(["Other", other]);
+    return ordered;
+  }, [chapters, canGroupByVolume]);
 
   const bg = isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]";
   const textCol = isDark ? "text-white" : "text-gray-900";
@@ -296,10 +413,10 @@ export default function MangaReader() {
         </header>
 
         {/* Main */}
-        <main className="flex-1 flex flex-col items-center justify-center gap-8 p-6">
-          <div className="text-center max-w-lg">
+        <main className="flex-1 flex flex-col items-center gap-8 p-6">
+          <div className="text-center max-w-lg pt-6">
             <h2 className="text-2xl font-bold text-white mb-2">Read manga, ad-free</h2>
-            <p className="text-white/50 text-sm">Paste a chapter URL from a supported site, pick from your history, or search for a manga.</p>
+            <p className="text-white/50 text-sm">Pick a title below, paste a chapter URL from a supported site, or search for a manga.</p>
           </div>
 
           <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
@@ -324,8 +441,69 @@ export default function MangaReader() {
             </div>
           )}
 
+          {/* Browse titles */}
+          <div className="w-full max-w-5xl pb-6">
+            <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+              <h3 className={`text-xs font-semibold uppercase tracking-wider flex items-center gap-2 ${subText}`}>
+                <Library className="h-4 w-4" /> All titles {titles.length ? `(${titles.length})` : ""}
+              </h3>
+              <div className="flex items-center gap-2 flex-1 justify-end min-w-[240px]">
+                <Input placeholder="Filter by name…" value={titleQuery} onChange={(e) => setTitleQuery(e.target.value)}
+                  className="max-w-[220px] bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+                <select value={titleSource} onChange={(e) => setTitleSource(e.target.value)}
+                  className={`text-sm rounded-md border px-2 py-1.5 ${isDark ? "bg-white/5 border-white/10 text-white/80" : "bg-white border-gray-200 text-gray-700"}`}>
+                  <option value="all">All sources</option>
+                  {sourceOptions.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {titlesLoading && (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                {Array.from({ length: 10 }).map((_, i) => (
+                  <div key={i} className="rounded-lg overflow-hidden">
+                    <Skeleton className="w-full" style={{ aspectRatio: "2/3" }} />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!titlesLoading && titlesError && (
+              <p className="text-sm text-red-400">{titlesError}</p>
+            )}
+
+            {!titlesLoading && !titlesError && visibleTitles.length === 0 && (
+              <p className={`text-sm ${subText}`}>No titles match this filter.</p>
+            )}
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+              {!titlesLoading && visibleTitles.map((t) => (
+                <button key={`${t.sourceId}:${t.url}`} onClick={() => openTitle(t)}
+                  className={`group text-left rounded-lg overflow-hidden border transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
+                  <div className={`relative w-full overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
+                    {t.thumbnail ? (
+                      <img src={t.thumbnail} alt="" loading="lazy" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className={`w-full h-full flex items-center justify-center ${subText}`}>
+                        <BookOpen className="h-8 w-8" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="p-2">
+                    <div className={`text-xs font-medium leading-snug line-clamp-2 ${isDark ? "text-white/90" : "text-gray-800"}`}>{t.title}</div>
+                    <div className={`text-[10px] mt-1 ${subText}`}>
+                      {t.sourceName}{t.latestChapter ? ` · ${t.latestChapter}` : ""}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
           {/* Keyboard shortcuts hint */}
-          <div className={`text-xs ${subText} text-center space-y-1`}>
+          <div className={`text-xs ${subText} text-center space-y-1 pb-6`}>
             <p>Keyboard shortcuts: <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">←</kbd> <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">→</kbd> chapters · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">T</kbd> theme · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">L</kbd> chapter list</p>
           </div>
         </main>
@@ -453,20 +631,67 @@ export default function MangaReader() {
         <div className="p-3">
           {chaptersLoading && <div className="flex justify-center py-8"><Loader2 className="h-5 w-5 animate-spin" /></div>}
           {chapters.length === 0 && !chaptersLoading && <p className="text-white/40 text-sm text-center py-8">Load a chapter first to see the list</p>}
-          <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
-            {chapters.map((ch) => {
-              const isCurrent = ch.num === parseInt(data.chapterNum);
-              return (
-                <button key={ch.num} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
-                  className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
-                    ? "bg-white/15 font-semibold"
-                    : hoverBg
-                  } ${isCurrent ? textCol : subText}`}>
-                  Chapter {ch.num}
+
+          {canGroupByVolume && (
+            <div className={`flex items-center gap-1 mb-2 p-0.5 rounded-lg ${isDark ? "bg-white/5" : "bg-gray-100"}`}>
+              {(["chapter", "volume"] as GroupMode[]).map((m) => (
+                <button key={m} onClick={() => setGroupMode(m)}
+                  className={`flex-1 px-2 py-1 rounded text-xs capitalize transition-colors ${groupMode === m
+                    ? isDark ? "bg-white/15 text-white" : "bg-white text-gray-900 shadow-sm"
+                    : subText}`}>
+                  {m === "chapter" ? "All chapters" : `By volume (${volumes.length})`}
                 </button>
-              );
-            })}
-          </div>
+              ))}
+            </div>
+          )}
+
+          {groupMode === "chapter" || !canGroupByVolume ? (
+            <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
+              {chapters.map((ch) => {
+                const isCurrent = ch.num === Number(data.chapterNum);
+                return (
+                  <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
+                    className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
+                      ? "bg-white/15 font-semibold"
+                      : hoverBg
+                    } ${isCurrent ? textCol : subText}`}>
+                    {ch.title || `Chapter ${ch.num}`}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[70vh] overflow-y-auto">
+              {volumeGroups.map(([vol, items]) => (
+                <details key={vol} open={items.some((c) => c.num === Number(data.chapterNum))}>
+                  <summary className={`cursor-pointer text-xs font-semibold uppercase tracking-wider px-2 py-1 rounded ${subText} ${hoverBg}`}>
+                    {vol === "Other" ? "Unnumbered" : `Volume ${vol}`}
+                    <span className="ml-2 font-normal normal-case">({items.length})</span>
+                  </summary>
+                  <div className="mt-0.5 space-y-0.5">
+                    {items.map((ch) => {
+                      const isCurrent = ch.num === Number(data.chapterNum);
+                      return (
+                        <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
+                          className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
+                            ? "bg-white/15 font-semibold"
+                            : hoverBg
+                          } ${isCurrent ? textCol : subText}`}>
+                          {ch.title || `Chapter ${ch.num}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </details>
+              ))}
+            </div>
+          )}
+
+          {canGroupByVolume && (
+            <p className={`text-[10px] mt-3 ${subText}`}>
+              Volume numbers come from MangaDex and may not cover every chapter.
+            </p>
+          )}
         </div>
       </SidePanel>
 

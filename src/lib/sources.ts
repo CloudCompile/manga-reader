@@ -27,11 +27,15 @@ export interface ChapterItem {
   num: number;
   url: string;
   title: string;
+  // Volume number this chapter belongs to, when it can be resolved.
+  volume?: string;
 }
 
 export interface ChapterListData {
   mangaName: string;
   chapters: ChapterItem[];
+  // Present only when volume grouping resolved confidently.
+  volumes?: string[];
 }
 
 export interface SearchResult {
@@ -39,6 +43,18 @@ export interface SearchResult {
   latestChapter: string;
   url: string;
   source: string;
+}
+
+// A series available from a source, used to build the browse listing.
+export interface TitleItem {
+  title: string;
+  // Where to send the reader: a series page, or a chapter to open directly.
+  url: string;
+  sourceId: string;
+  sourceName: string;
+  latestChapter: string;
+  totalChapters: number;
+  thumbnail?: string;
 }
 
 interface Source {
@@ -59,6 +75,11 @@ interface Source {
   fetchList?: (url: string) => Promise<{ chapters: ChapterItem[]; mangaName?: string }>;
   // Custom search.
   search?: (query: string) => Promise<SearchResult[]>;
+  // Enumerate every series the source hosts. Sources that only carry one
+  // series per host derive it from their listing instead (see listTitles).
+  browse?: () => Promise<TitleItem[]>;
+  // Derive a single title from this source's listing page.
+  browseFromListing?: boolean;
 }
 
 export const PROXY_BASE =
@@ -366,6 +387,7 @@ const mangafragrant: Source = {
   id: "mangafragrant",
   name: "MangaFragrant",
   hosts: [/mangafragrant(flower)?\.com$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://www.mangafragrant.com/manga/"],
   parseChapter(html, url) {
@@ -394,6 +416,7 @@ const komic: Source = {
   id: "komic",
   name: "Komi Can't Communicate",
   hosts: [/komicantcommunicatechapters\.website$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://komicantcommunicatechapters.website/"],
   parseChapter(html, url) {
@@ -421,6 +444,7 @@ const bluebox: Source = {
   id: "bluebox",
   name: "Blue Box",
   hosts: [/blue-box-manga\.online$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://blue-box-manga.online/comic/"],
   parseChapter(html, url) {
@@ -457,6 +481,7 @@ const dandadana: Source = {
   id: "dandadana",
   name: "Dandadan",
   hosts: [/dandadana\.com$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://dandadana.com/"],
   parseChapter(html, url) {
@@ -484,6 +509,7 @@ const oshino: Source = {
   id: "oshino",
   name: "Oshi No Ko",
   hosts: [/readoshino\.com$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://readoshino.com/"],
   parseChapter(html, url) {
@@ -512,6 +538,7 @@ const chainsawman: Source = {
   id: "chainsawman",
   name: "Chainsaw Man",
   hosts: [/onlinechainsawmanmanga\.us$/i],
+  browseFromListing: true,
   seriesKey: GENERIC_SLUG,
   listingUrls: () => ["https://onlinechainsawmanmanga.us/"],
   parseChapter(html, url) {
@@ -567,7 +594,10 @@ const ALLMANGA_MANGA_QUERY =
   "query($_id:String!){manga(_id:$_id){_id name thumbnail availableChapters availableChaptersDetail}}";
 
 const ALLMANGA_SEARCH_QUERY =
-  "query($search:SearchInput,$limit:Int){mangas(search:$search,limit:$limit){edges{_id name thumbnail availableChapters}}}";
+  "query($search:SearchInput,$limit:Int){mangas(search:$search,limit:$limit){edges{_id name englishName nativeName thumbnail availableChapters}}}";
+
+const ALLMANGA_BROWSE_QUERY =
+  "query($size:Int){queryPopular(type:manga,size:$size){total recommendations{anyCard{_id name englishName nativeName thumbnail}}}}";
 
 const ALLMANGA_PAGES_QUERY =
   "query($mangaId:String!,$translationType:VaildTranslationTypeMangaEnumType!,$chapterString:String!,$page:Int,$limit:Int,$offset:Int){chapterPages(mangaId:$mangaId,translationType:$translationType,chapterString:$chapterString,page:$page,limit:$limit,offset:$offset){edges{streamerId sourceUrl sourceName chapterString pictureUrls pictureUrlsProcessed pictureUrlHead}pageInfo{total}}}";
@@ -575,6 +605,8 @@ const ALLMANGA_PAGES_QUERY =
 interface AllMangaDetail {
   _id: string;
   name: string;
+  englishName?: string | null;
+  nativeName?: string | null;
   availableChapters?: Record<string, number>;
   availableChaptersDetail?: Record<string, string[]>;
 }
@@ -583,6 +615,25 @@ interface AllMangaPages {
     edges: { pictureUrls?: string[]; pictureUrlsProcessed?: string[]; pictureUrlHead?: string }[];
     pageInfo?: { total?: number };
   } | null;
+}
+interface AllMangaEdge {
+  _id: string;
+  name: string;
+  englishName?: string | null;
+  nativeName?: string | null;
+  thumbnail?: string | null;
+  availableChapters?: Record<string, number>;
+}
+
+// Covers arrive either as an absolute URL or a path relative to the CDN.
+function allmangaImage(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  if (/^https?:/i.test(raw)) return raw;
+  return `https://cdn.allanime.day/${raw.replace(/^\/+/, "")}`;
+}
+
+function allmangaChapterCount(e: AllMangaEdge): number {
+  return e.availableChapters?.sub || e.availableChapters?.raw || 0;
 }
 
 function allmangaParts(url: string): { id: string; chapter: string; type: string } {
@@ -636,10 +687,11 @@ const allmanga: Source = {
     const higher = idx > 0 ? chapters[idx - 1] : null; // list is newest-first
     const lower = idx >= 0 && idx < chapters.length - 1 ? chapters[idx + 1] : null;
     const link = (c: string | null) => (c ? `https://allmanga.to/manga/${id}/chapter-${c}-${type}` : null);
+    const displayName = manga?.englishName || manga?.name || "Manga";
 
     return {
-      title: chapter ? `${manga?.name || "Manga"} Chapter ${chapter}` : manga?.name || "Manga",
-      mangaName: manga?.name || "Manga",
+      title: chapter ? `${displayName} Chapter ${chapter}` : displayName,
+      mangaName: displayName,
       chapterNum: chapter,
       images,
       prevUrl: link(lower),
@@ -653,7 +705,7 @@ const allmanga: Source = {
     const detail = await allmangaGql<{ manga: AllMangaDetail }>(ALLMANGA_MANGA_QUERY, { _id: id });
     const chapters = detail.manga?.availableChaptersDetail?.[type] || [];
     return {
-      mangaName: detail.manga?.name,
+      mangaName: detail.manga?.englishName || detail.manga?.name,
       chapters: chapters.map((c) => ({
         num: numFromSlug(c),
         url: `https://allmanga.to/manga/${id}/chapter-${c}-${type}`,
@@ -662,17 +714,37 @@ const allmanga: Source = {
     };
   },
   async search(query): Promise<SearchResult[]> {
-    const data = await allmangaGql<{ mangas: { edges: { _id: string; name: string; availableChapters?: Record<string, number> }[] } }>(
-      ALLMANGA_SEARCH_QUERY,
-      { search: { query }, limit: 24 }
-    );
+    const data = await allmangaGql<{ mangas: { edges: AllMangaEdge[] } }>(ALLMANGA_SEARCH_QUERY, {
+      search: { query },
+      limit: 24,
+    });
     return (data.mangas?.edges || []).map((e) => {
-      const count = e.availableChapters?.sub || e.availableChapters?.raw || 0;
+      const count = allmangaChapterCount(e);
       return {
         title: e.name,
         latestChapter: count ? `Ch ${count}` : "",
         url: `https://allmanga.to/manga/${e._id}`,
         source: "AllManga",
+      };
+    });
+  },
+  async browse(): Promise<TitleItem[]> {
+    // A blank query enumerates the catalogue, which is how the browse grid is
+    // populated without paging through the site.
+    const data = await allmangaGql<{ mangas: { edges: AllMangaEdge[] } }>(ALLMANGA_SEARCH_QUERY, {
+      search: {},
+      limit: 60,
+    });
+    return (data.mangas?.edges || []).map((e) => {
+      const count = allmangaChapterCount(e);
+      return {
+        title: e.englishName || e.name,
+        url: `https://allmanga.to/manga/${e._id}`,
+        sourceId: "allmanga",
+        sourceName: "AllManga",
+        latestChapter: count ? `Ch ${count}` : "",
+        totalChapters: count,
+        thumbnail: allmangaImage(e.thumbnail),
       };
     });
   },
@@ -814,7 +886,15 @@ export async function fetchChapterList(url: string): Promise<ChapterListData> {
   if (slug) chapters = chapters.filter((c) => source.seriesKey(c.url) === slug);
   chapters.sort((a, b) => b.num - a.num);
 
-  const data: ChapterListData = { mangaName, chapters };
+  // Volume grouping is best-effort and never fails the request.
+  let volumes: string[] | undefined;
+  try {
+    volumes = (await applyVolumes(mangaName, chapters)) || undefined;
+  } catch {
+    volumes = undefined;
+  }
+
+  const data: ChapterListData = { mangaName, chapters, volumes };
   LIST_CACHE.set(cacheKey, { data, ts: Date.now() });
   return data;
 }
@@ -868,4 +948,232 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
   for (const s of settled) if (s.status === "fulfilled") out.push(...s.value);
   SEARCH_CACHE.set(cacheKey, { data: out, ts: Date.now() });
   return out;
+}
+
+// ───────────────────────────────────────────────────────────
+// Title listing
+// ───────────────────────────────────────────────────────────
+
+const TITLE_CACHE = new Map<string, { data: TitleItem[]; ts: number }>();
+
+// Group a listing page's chapter links into the distinct series it mentions.
+async function titlesFromListing(source: Source): Promise<TitleItem[]> {
+  if (!source.parseList || !source.listingUrls) return [];
+  for (const lu of source.listingUrls("")) {
+    try {
+      const html = await fetchText(lu, { referer: originOf(lu) });
+      const items = source.parseList(html, lu);
+      if (!items.length) continue;
+      const bySeries = new Map<string, { best: ChapterItem; count: number }>();
+      for (const item of items) {
+        const slug = source.seriesKey(item.url);
+        if (!slug) continue;
+        const current = bySeries.get(slug);
+        if (!current) bySeries.set(slug, { best: item, count: 1 });
+        else {
+          current.count += 1;
+          if (item.num > current.best.num) current.best = item;
+        }
+      }
+      if (!bySeries.size) continue;
+      return Array.from(bySeries.entries()).map(([slug, v]) => ({
+        title: titleFromSlug(slug),
+        url: v.best.url,
+        sourceId: source.id,
+        sourceName: source.name,
+        latestChapter: v.best.num ? `Ch ${v.best.num}` : "",
+        totalChapters: v.count,
+      }));
+    } catch {
+      /* try the next listing URL */
+    }
+  }
+  return [];
+}
+
+// Every series the reader can open, grouped by source in the UI.
+export async function listTitles(): Promise<TitleItem[]> {
+  const cached = TITLE_CACHE.get("all");
+  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+
+  const tasks = SOURCES.map(async (source) => {
+    if (source.browse) {
+      try {
+        return await source.browse();
+      } catch {
+        return [];
+      }
+    }
+    if (!source.browseFromListing) return [];
+    try {
+      return await titlesFromListing(source);
+    } catch {
+      return [];
+    }
+  });
+
+  const settled = await Promise.allSettled(tasks);
+  const seen = new Set<string>();
+  const out: TitleItem[] = [];
+  for (const s of settled) {
+    if (s.status !== "fulfilled") continue;
+    for (const t of s.value) {
+      const key = `${t.sourceId}:${t.url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(t);
+    }
+  }
+  TITLE_CACHE.set("all", { data: out, ts: Date.now() });
+  return out;
+}
+
+// ───────────────────────────────────────────────────────────
+// Volume grouping
+// ───────────────────────────────────────────────────────────
+//
+// None of the supported sites publish volume numbers, so a confident title
+// match against MangaDex's chapter->volume aggregate is used instead. When no
+// confident match exists, `volumes` stays undefined and the UI simply omits
+// grouping rather than inventing volumes.
+
+const MANGADEX_API = "https://api.mangadex.org";
+
+// Reprints and side stories carry volume data that does not line up with the
+// chapter numbering the reader sees, so they are never auto-matched.
+const VOLUME_EXCLUDE =
+  /(fan[- ]?colou?r|doujin|one[- ]?shot|anthology|full[- ]?colou?r|official colou?r|spin[- ]?off)/i;
+
+const VOLUME_MIN_SCORE = 0.6;
+const VOLUME_MIN_COVERAGE = 0.25;
+const VOLUME_MIN_MATCHES = 4;
+
+function normTitle(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleScore(a: string, b: string): number {
+  const na = normTitle(a);
+  const nb = normTitle(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const A = new Set(na.split(" ").filter(Boolean));
+  const B = new Set(nb.split(" ").filter(Boolean));
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter += 1;
+  return inter / (A.size + B.size - inter);
+}
+
+interface MangaDexMatch {
+  id: string;
+  title: string;
+  score: number;
+}
+
+function allTitles(m: {
+  attributes?: { title?: Record<string, string>; altTitles?: Record<string, string>[] };
+}): string[] {
+  const out: string[] = [];
+  for (const v of Object.values(m.attributes?.title || {})) if (v) out.push(v);
+  for (const alt of m.attributes?.altTitles || [])
+    for (const v of Object.values(alt)) if (v) out.push(v);
+  return out;
+}
+
+async function findMangaDexMatch(mangaName: string): Promise<MangaDexMatch | null> {
+  const res = await fetch(
+    `${MANGADEX_API}/manga?title=${encodeURIComponent(mangaName)}&limit=8&order%5Brelevance%5D=desc`,
+    { headers: { "User-Agent": UA }, cache: "no-store" }
+  );
+  if (!res.ok) return null;
+  const json = (await res.json()) as {
+    data?: { id: string; attributes?: { title?: Record<string, string>; altTitles?: Record<string, string>[] } }[];
+  };
+  let best: MangaDexMatch | null = null;
+  for (const m of json.data || []) {
+    const titles = allTitles(m);
+    if (!titles.length) continue;
+    if (titles.some((t) => VOLUME_EXCLUDE.test(t))) continue;
+    let score = 0;
+    for (const t of titles) score = Math.max(score, titleScore(mangaName, t));
+    if (score < VOLUME_MIN_SCORE) continue;
+    const primary = Object.values(m.attributes?.title || {})[0] || titles[0];
+    if (!best || score > best.score) best = { id: m.id, title: primary, score };
+  }
+  return best;
+}
+
+const VOLUME_CACHE = new Map<string, { data: Map<number, string> | null; ts: number }>();
+
+// chapter number -> volume number, or null when no confident match exists.
+async function mangadexChapterVolumes(mangaName: string): Promise<Map<number, string> | null> {
+  const key = normTitle(mangaName);
+  if (!key) return null;
+  const cached = VOLUME_CACHE.get(key);
+  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+
+  let map: Map<number, string> | null = null;
+  try {
+    const match = await findMangaDexMatch(mangaName);
+    if (match) {
+      const res = await fetch(`${MANGADEX_API}/manga/${match.id}/aggregate`, {
+        headers: { "User-Agent": UA },
+        cache: "no-store",
+      });
+      if (res.ok) {
+        const agg = (await res.json()) as { volumes?: Record<string, { chapters?: Record<string, unknown> }> };
+        const resolved = new Map<number, string>();
+        for (const [vol, entry] of Object.entries(agg.volumes || {})) {
+          if (!/^[0-9]+$/.test(vol)) continue;
+          for (const ch of Object.keys(entry?.chapters || {})) {
+            const n = numFromSlug(ch);
+            if (n && !resolved.has(n)) resolved.set(n, vol);
+          }
+        }
+        if (resolved.size) map = resolved;
+      }
+    }
+  } catch {
+    map = null;
+  }
+  VOLUME_CACHE.set(key, { data: map, ts: Date.now() });
+  return map;
+}
+
+// Annotate chapters with volumes, returning the volume list. Returns null when
+// the match is too thin to be trustworthy.
+async function applyVolumes(
+  mangaName: string,
+  chapters: ChapterItem[]
+): Promise<string[] | null> {
+  if (!mangaName || chapters.length < VOLUME_MIN_MATCHES) return null;
+  const map = await mangadexChapterVolumes(mangaName);
+  if (!map) return null;
+
+  let matched = 0;
+  for (const ch of chapters) {
+    const vol = map.get(ch.num);
+    if (vol) {
+      ch.volume = vol;
+      matched += 1;
+    }
+  }
+  if (matched < VOLUME_MIN_MATCHES || matched / chapters.length < VOLUME_MIN_COVERAGE) {
+    for (const ch of chapters) delete ch.volume;
+    return null;
+  }
+
+  const vols = Array.from(new Set(chapters.map((c) => c.volume).filter(Boolean))) as string[];
+  if (vols.length < 2) {
+    for (const ch of chapters) delete ch.volume;
+    return null;
+  }
+  vols.sort((a, b) => Number(a) - Number(b));
+  return vols;
 }
