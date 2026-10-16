@@ -1,6 +1,18 @@
 # Manga Reader
 
-Ad-free manga reader. Paste a chapter URL from mangafragrant.com and read clean.
+Ad-free manga reader. Paste a chapter URL from any supported site and read clean.
+
+## Supported sources
+
+| Site | Notes |
+|------|-------|
+| mangafragrant.com | |
+| komicantcommunicatechapters.website | |
+| blue-box-manga.online | |
+| dandadana.com | |
+| readoshino.com | |
+| onlinechainsawmanmanga.us | Origin is frequently offline (HTTP 522) |
+| allmanga.to | Chapter lists and search work; page images require solving the site's captcha |
 
 ## Features
 
@@ -8,11 +20,20 @@ Ad-free manga reader. Paste a chapter URL from mangafragrant.com and read clean.
 - Dark / Light theme toggle
 - Fit modes: Width, Height, Original
 - Chapter list sidebar (auto-fetched)
-- Search manga by name
-- Reading history (stored locally)
-- Offline save (IndexedDB)
+- Search across all sources
+- Reading history
 - Page jumper with keyboard shortcuts
 - Mobile responsive
+- Storage works on constrained browsers: state is kept in a `Secure` cookie
+  with an in-memory fallback, so it never depends on `localStorage`,
+  `IndexedDB`, or cookie support.
+
+## Storage
+
+Reading history, the last-read chapter, and the theme choice are persisted in a
+single `Secure; SameSite=Lax` cookie. Browsers and Android WebView builds that
+block cookies or lack `localStorage` / `IndexedDB` still work: the reader falls
+back to in-memory state for the current session instead of throwing.
 
 ## Deploy to Vercel
 

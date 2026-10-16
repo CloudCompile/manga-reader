@@ -17,10 +17,17 @@ import {
   Search,
   X,
   History,
-  Download,
-  ChevronDown,
   Menu,
 } from "lucide-react";
+import {
+  getHistory,
+  pushHistory,
+  getLastRead,
+  setLastRead,
+  getTheme,
+  setTheme as persistTheme,
+  type HistoryEntry,
+} from "@/lib/storage";
 
 // ─── Types ───────────────────────────────────────────
 interface ChapterData {
@@ -31,6 +38,7 @@ interface ChapterData {
   mangaName: string;
   chapterNum: string;
   seriesSlug: string;
+  sourceName?: string;
   warning?: string;
 }
 
@@ -40,100 +48,17 @@ interface ChapterItem {
   title: string;
 }
 
-interface HistoryEntry {
+interface SearchResult {
+  title: string;
+  latestChapter: string;
   url: string;
-  mangaName: string;
-  chapterNum: string;
-  timestamp: number;
-}
-
-interface OfflineChapter {
-  url: string;
-  mangaName: string;
-  chapterNum: string;
-  images: string[];
-  savedAt: number;
+  source?: string;
 }
 
 type Theme = "dark" | "light";
 type FitMode = "width" | "height" | "original";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
-
-// ─── LocalStorage helpers ────────────────────────────
-function getHistory(): HistoryEntry[] {
-  if (typeof window === "undefined") return [];
-  try { return JSON.parse(localStorage.getItem("manga-history") || "[]"); } catch { return []; }
-}
-function saveHistory(entry: HistoryEntry) {
-  if (typeof window === "undefined") return;
-  const h = getHistory().filter((e) => e.url !== entry.url);
-  h.unshift({ ...entry, timestamp: Date.now() });
-  localStorage.setItem("manga-history", JSON.stringify(h.slice(0, 50)));
-}
-function getLastRead(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("manga-last-read");
-}
-function setLastRead(url: string) {
-  if (typeof window === "undefined") return;
-  localStorage.setItem("manga-last-read", url);
-}
-
-// ─── IndexedDB for offline ───────────────────────────
-const DB_NAME = "manga-offline";
-const DB_VERSION = 1;
-const STORE = "chapters";
-
-function openDB(): Promise<IDBDatabase> {
-  if (typeof window === "undefined") throw new Error("SSR");
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: "url" });
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function saveOffline(data: OfflineChapter) {
-  const db = await openDB();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).put(data);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function getOffline(url: string): Promise<OfflineChapter | null> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const req = tx.objectStore(STORE).get(url);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function getAllOffline(): Promise<OfflineChapter[]> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function deleteOffline(url: string) {
-  const db = await openDB();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).delete(url);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
 
 // ─── Component ───────────────────────────────────────
 export default function MangaReader() {
@@ -150,17 +75,13 @@ export default function MangaReader() {
   const [showChapters, setShowChapters] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<{ title: string; latestChapter: string; url: string }[]>([]);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
-  const [offlineChapters, setOfflineChapters] = useState<OfflineChapter[]>([]);
-  const [showOffline, setShowOffline] = useState(false);
   const [currentPage, setCurrentPage] = useState(0);
   const [pageInput, setPageInput] = useState("");
   const [showPageJumper, setShowPageJumper] = useState(false);
-  const [savingOffline, setSavingOffline] = useState(false);
-  const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -169,11 +90,9 @@ export default function MangaReader() {
   // Init
   useEffect(() => {
     setHistory(getHistory());
-    getAllOffline().then(setOfflineChapters).catch(() => {});
     const saved = getLastRead();
     if (saved) setUrl(saved);
-    const savedTheme = localStorage?.getItem("manga-theme");
-    if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+    setTheme(getTheme());
   }, []);
 
   // Scroll listener
@@ -217,7 +136,6 @@ export default function MangaReader() {
         setShowChapters(false);
         setShowSearch(false);
         setShowHistory(false);
-        setShowOffline(false);
         setShowPageJumper(false);
         setShowMobileMenu(false);
       } else if (e.key === "g" || e.key === "G") {
@@ -232,7 +150,7 @@ export default function MangaReader() {
     setLoadedImages((prev) => new Set(prev).add(index));
   }, []);
 
-  const loadChapter = useCallback(async (chapterUrl: string, offline?: OfflineChapter) => {
+  const loadChapter = useCallback(async (chapterUrl: string) => {
     if (!chapterUrl.trim()) return;
     setLoading(true);
     setError("");
@@ -247,36 +165,20 @@ export default function MangaReader() {
     setShowMobileMenu(false);
 
     try {
-      if (offline) {
-        // Load from offline cache
-        const chapterData: ChapterData = {
-          title: `${offline.mangaName}, Chapter ${offline.chapterNum}`,
-          images: offline.images,
-          prevUrl: null,
-          nextUrl: null,
-          mangaName: offline.mangaName,
-          chapterNum: offline.chapterNum,
-          seriesSlug: "",
-          warning: "Offline mode — navigation disabled",
-        };
-        setData(chapterData);
-        setIsOfflineMode(true);
-      } else {
-        setIsOfflineMode(false);
-        const res = await fetch("/api/scrape", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: chapterUrl }),
-        });
-        const json = await res.json();
-        if (!res.ok) throw new Error(json.error || "Failed to load chapter");
-        setData(json);
-        saveHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() });
-        setHistory(getHistory());
+      const res = await fetch("/api/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: chapterUrl }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Failed to load chapter");
+      setData(json);
+      setHistory(
+        pushHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() })
+      );
 
-        // Fetch chapter list in background
-        if (json.seriesSlug) fetchChapterList(chapterUrl);
-      }
+      // Fetch chapter list in background for the sidebar and navigation.
+      fetchChapterList(chapterUrl);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -312,32 +214,13 @@ export default function MangaReader() {
     finally { setSearchLoading(false); }
   };
 
-  const handleSaveOffline = async () => {
-    if (!data || data.images.length === 0) return;
-    setSavingOffline(true);
-    try {
-      // Pre-fetch all images through proxy to cache them
-      const imageUrls = data.images.map(PROXY);
-      await saveOffline({
-        url,
-        mangaName: data.mangaName,
-        chapterNum: data.chapterNum,
-        images: imageUrls,
-        savedAt: Date.now(),
-      });
-      const updated = await getAllOffline();
-      setOfflineChapters(updated);
-    } catch { /* ignore */ }
-    finally { setSavingOffline(false); }
-  };
-
   const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); loadChapter(url); };
   const goToChapter = (chapterUrl: string | null) => { if (chapterUrl) loadChapter(chapterUrl); };
   const scrollToTop = () => scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   const toggleTheme = () => {
     const next = theme === "dark" ? "light" : "dark";
     setTheme(next);
-    localStorage.setItem("manga-theme", next);
+    persistTheme(next);
   };
 
   const jumpToPage = (page: number) => {
@@ -408,7 +291,6 @@ export default function MangaReader() {
           <div className="flex items-center gap-2">
             <button onClick={() => setShowSearch(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="Search manga"><Search className="h-5 w-5" /></button>
             <button onClick={() => setShowHistory(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="History"><History className="h-5 w-5" /></button>
-            <button onClick={() => setShowOffline(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="Offline"><Download className="h-5 w-5" /></button>
             <button onClick={toggleTheme} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`}><Sun className="h-5 w-5" /></button>
           </div>
         </header>
@@ -417,11 +299,11 @@ export default function MangaReader() {
         <main className="flex-1 flex flex-col items-center justify-center gap-8 p-6">
           <div className="text-center max-w-lg">
             <h2 className="text-2xl font-bold text-white mb-2">Read manga, ad-free</h2>
-            <p className="text-white/50 text-sm">Paste a mangafragrant.com chapter URL, pick from your history, or search for a manga.</p>
+            <p className="text-white/50 text-sm">Paste a chapter URL from a supported site, pick from your history, or search for a manga.</p>
           </div>
 
           <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
-            <Input type="url" placeholder="https://www.mangafragrant.com/manga/..." value={url} onChange={(e) => setUrl(e.target.value)}
+            <Input type="url" placeholder="https://example.com/manga/title-chapter-1/" value={url} onChange={(e) => setUrl(e.target.value)}
               className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
             <Button type="submit">Read</Button>
           </form>
@@ -463,7 +345,7 @@ export default function MangaReader() {
                 <button key={i} onClick={() => { loadChapter(r.url); setShowSearch(false); }}
                   className="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-white/5 text-white/80">
                   <div className="font-medium">{r.title}</div>
-                  {r.latestChapter && <div className="text-xs text-white/40">{r.latestChapter}</div>}
+                  <div className="text-xs text-white/40">{[r.latestChapter, r.source].filter(Boolean).join(" · ")}</div>
                 </button>
               ))}
             </div>
@@ -479,22 +361,6 @@ export default function MangaReader() {
                 <div className="font-medium">{h.mangaName}</div>
                 <div className="text-xs text-white/40">Ch {h.chapterNum} · {new Date(h.timestamp).toLocaleDateString()}</div>
               </button>
-            ))}
-          </div>
-        </SidePanel>
-
-        <SidePanel title="Offline Library" icon={<Download className="h-4 w-4" />} show={showOffline} onClose={() => setShowOffline(false)}>
-          <div className="p-4 space-y-1">
-            {offlineChapters.length === 0 && <p className="text-white/40 text-sm">No saved chapters</p>}
-            {offlineChapters.map((o) => (
-              <div key={o.url} className="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-white/5">
-                <button onClick={() => { loadChapter(o.url, o); setShowOffline(false); }} className="text-left text-sm text-white/80">
-                  <div className="font-medium">{o.mangaName}</div>
-                  <div className="text-xs text-white/40">Ch {o.chapterNum} · {o.images.length} pages</div>
-                </button>
-                <button onClick={() => { deleteOffline(o.url); getAllOffline().then(setOfflineChapters); }}
-                  className="text-white/30 hover:text-red-400 p-1"><X className="h-3 w-3" /></button>
-              </div>
             ))}
           </div>
         </SidePanel>
@@ -518,6 +384,8 @@ export default function MangaReader() {
   }
 
   // ─── Reader ─────────────────────────────────────────
+  if (!data) return null;
+
   return (
     <div className={`h-screen flex flex-col ${bg} ${textCol} overflow-hidden`}>
       {/* Top bar */}
@@ -527,7 +395,7 @@ export default function MangaReader() {
           <BookOpen className="h-4 w-4 shrink-0" />
           <h1 className="text-sm font-semibold truncate">{data.mangaName}</h1>
           {data.chapterNum && <span className={subText}>· Ch {data.chapterNum}</span>}
-          {isOfflineMode && <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">OFFLINE</span>}
+          {data.sourceName && <span className={`hidden sm:inline text-[10px] px-1.5 py-0.5 rounded ${isDark ? "bg-white/10 text-white/50" : "bg-gray-100 text-gray-500"}`}>{data.sourceName}</span>}
         </div>
 
         {/* Desktop buttons */}
@@ -544,9 +412,6 @@ export default function MangaReader() {
           <button onClick={() => setShowPageJumper((v) => !v)} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`} title="Jump to page (G)">
             {currentPage}/{totalPages}
           </button>
-          <button onClick={handleSaveOffline} disabled={savingOffline} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`} title="Save offline">
-            {savingOffline ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-          </button>
           <button onClick={toggleTheme} className={`p-1.5 rounded ${hoverBg} ${subText}`}><Sun className="h-4 w-4" /></button>
         </div>
       </header>
@@ -562,9 +427,6 @@ export default function MangaReader() {
             </button>
           ))}
           <button onClick={() => { setShowPageJumper((v) => !v); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>Page {currentPage}/{totalPages}</button>
-          <button onClick={() => { handleSaveOffline(); setShowMobileMenu(false); }} disabled={savingOffline} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
-            {savingOffline ? "Saving…" : <><Download className="h-3.5 w-3.5 inline mr-1" />Save</>}
-          </button>
           <button onClick={() => { toggleTheme(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
             {isDark ? <Sun className="h-3.5 w-3.5 inline mr-1" /> : <Moon className="h-3.5 w-3.5 inline mr-1" />}Theme
           </button>
