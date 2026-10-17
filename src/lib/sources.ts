@@ -105,7 +105,21 @@ function decodeEntities(s: string): string {
     .replace(/&#8212;/g, "\u2014")
     .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => {
+      try {
+        return String.fromCodePoint(parseInt(h, 16));
+      } catch {
+        return "";
+      }
+    })
+    .replace(/&#([0-9]+);/g, (_, d: string) => {
+      try {
+        return String.fromCodePoint(parseInt(d, 10));
+      } catch {
+        return "";
+      }
+    });
 }
 
 function stripTags(s: string): string {
@@ -562,6 +576,203 @@ const chainsawman: Source = {
   },
 };
 
+// ── specterscans.com — Next.js catalogue ───────────────────
+//
+// A multi-series catalogue (unlike the single-series hosts above). Series
+// pages carry the full chapter list; chapter pages embed the ordered page
+// list in the React Server Component payload. specterscans.net mirrors the
+// same app under a second host with a different series slug set.
+const SPECTRE_ORIGIN = "https://specterscans.com";
+
+function spectreSlug(url: string): string {
+  const m = url.match(/\/series\/([^/?#]+)/i);
+  if (!m) return "";
+  try {
+    return decodeURIComponent(m[1]).toLowerCase();
+  } catch {
+    return m[1].toLowerCase();
+  }
+}
+
+function spectreUrl(base: string, path: string): string {
+  try {
+    return new URL(path, originOf(base)).href;
+  } catch {
+    return `${SPECTRE_ORIGIN}${path}`;
+  }
+}
+
+function spectreSeriesUrl(url: string): string {
+  const slug = spectreSlug(url);
+  return slug ? spectreUrl(url, `/series/${slug}`) : url;
+}
+
+function spectreNum(html: string, key: string): string {
+  const m = html.match(new RegExp(`"${key}\\\\?":(null|[0-9]+(?:\\.[0-9]+)?)`));
+  return m && m[1] !== "null" ? m[1] : "";
+}
+
+function spectreField(html: string, key: string): string {
+  const m = html.match(new RegExp(`"${key}\\\\?":\\\\?"([^"]+)"`));
+  return m ? decodeEntities(m[1].replace(/\\+$/, "").replace(/\\\//g, "/")) : "";
+}
+
+// Page images, in reading order.
+function spectreImages(html: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const url = raw.replace(/\\+$/, "").replace(/\\\//g, "/").replace(/&amp;/g, "&");
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) return;
+    seen.add(url);
+    out.push(url);
+  };
+  // The reader serialises its page list into the RSC payload; prefer it over
+  // the markup because lazy pages are not always rendered as <img>.
+  const payload = /"imageUrl\\?":\\?"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = payload.exec(html)) !== null) push(m[1]);
+  if (out.length) return out;
+  for (const tag of html.match(/<img\b[^>]*>/gi) || []) {
+    if (!/reader-img/.test(attr(tag, "class"))) continue;
+    const src = attr(tag, "src") || attr(tag, "data-src");
+    if (src) push(src);
+  }
+  return out;
+}
+
+function spectreChapterLinks(html: string, slug: string, base: string): ChapterItem[] {
+  if (!slug) return [];
+  // Slugs may contain characters the page entity-encodes inside hrefs
+  // (e.g. "lawyer's" renders as "lawyer&#x27;s").
+  const slugRe = escapeReg(slug).replace(/'/g, "(?:'|&#x27;|&#39;|&apos;)");
+  const re = new RegExp(
+    `href=["'](?:https?://[^"']*)?/series/${slugRe}/chapter/([0-9]+(?:[.-][0-9]+)?)/?["']`,
+    "gi"
+  );
+  const map = new Map<number, ChapterItem>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const num = numFromSlug(m[1]);
+    if (map.has(num)) continue;
+    map.set(num, {
+      num,
+      url: spectreUrl(base, `/series/${slug}/chapter/${m[1]}`),
+      title: chapterLabel(num, m[1]),
+    });
+  }
+  return Array.from(map.values());
+}
+
+function spectreChapterFromHtml(html: string, url: string): RawChapter {
+  const { title, h1 } = pageTitle(html);
+  const parsed = parseChapterTitle(h1 || title);
+  const slug = spectreSlug(url);
+  const prev = spectreNum(html, "prevNumber");
+  const next = spectreNum(html, "nextNumber");
+  return {
+    title,
+    mangaName: spectreField(html, "seriesTitle") || parsed.mangaName,
+    chapterNum: spectreNum(html, "chapterNumber") || parsed.chapterNum,
+    images: spectreImages(html),
+    prevUrl: prev ? spectreUrl(url, `/series/${slug}/chapter/${prev}`) : null,
+    nextUrl: next ? spectreUrl(url, `/series/${slug}/chapter/${next}`) : null,
+  };
+}
+
+const specterscans: Source = {
+  id: "specterscans",
+  name: "Spectre Scans",
+  hosts: [/specterscans\.(?:com|net)$/i],
+  seriesKey: spectreSlug,
+  async fetchChapter(url): Promise<RawChapter> {
+    // A series URL (from search or browse) resolves to its newest readable
+    // chapter; the newest entry is sometimes an empty placeholder.
+    if (!/\/chapter\//i.test(url)) {
+      const page = await fetchText(url, { referer: originOf(url) });
+      const chapters = spectreChapterLinks(page, spectreSlug(url), url).sort((a, b) => b.num - a.num);
+      if (!chapters.length) throw new Error("No chapters found for this series.");
+      for (const c of chapters.slice(0, 3)) {
+        const raw = spectreChapterFromHtml(await fetchText(c.url, { referer: originOf(c.url) }), c.url);
+        if (raw.images.length) return raw;
+      }
+      const first = chapters[0];
+      return spectreChapterFromHtml(await fetchText(first.url, { referer: originOf(first.url) }), first.url);
+    }
+    return spectreChapterFromHtml(await fetchText(url, { referer: originOf(url) }), url);
+  },
+  async fetchList(url): Promise<{ chapters: ChapterItem[]; mangaName?: string }> {
+    const seriesUrl = spectreSeriesUrl(url);
+    const html = await fetchText(seriesUrl, { referer: originOf(seriesUrl) });
+    const chapters = spectreChapterLinks(html, spectreSlug(seriesUrl), seriesUrl);
+    const h1 = stripTags(decodeEntities((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || ""));
+    const og = decodeEntities((html.match(/<meta property="og:title" content="([^"]*)"/i) || [])[1] || "");
+    return { chapters, mangaName: h1 || og || undefined };
+  },
+  async search(query): Promise<SearchResult[]> {
+    const text = await fetchText(`${SPECTRE_ORIGIN}/api/search?q=${encodeURIComponent(query)}`, {
+      referer: `${SPECTRE_ORIGIN}/`,
+    });
+    const json = JSON.parse(text) as {
+      results?: { slug?: string; title?: string }[];
+      foreign?: { href?: string; title?: string }[];
+    };
+    const out: SearchResult[] = [];
+    for (const r of json.results || []) {
+      if (!r.slug || !r.title) continue;
+      out.push({
+        title: r.title,
+        latestChapter: "",
+        url: spectreUrl(SPECTRE_ORIGIN, `/series/${r.slug}`),
+        source: "Spectre Scans",
+      });
+    }
+    // "foreign" entries live on the .net mirror, which this source also reads.
+    for (const f of json.foreign || []) {
+      if (!f.href || !f.title || !getSource(f.href)) continue;
+      out.push({ title: f.title, latestChapter: "", url: f.href, source: "Spectre Scans" });
+    }
+    return out;
+  },
+  async browse(): Promise<TitleItem[]> {
+    // The catalogue is server-rendered: the sitemap lists every series with
+    // its cover, and /a-z supplies the display titles.
+    const [sitemap, az] = await Promise.all([
+      fetchText(`${SPECTRE_ORIGIN}/sitemap.xml`, { referer: `${SPECTRE_ORIGIN}/` }).catch(() => ""),
+      fetchText(`${SPECTRE_ORIGIN}/a-z`, { referer: `${SPECTRE_ORIGIN}/` }).catch(() => ""),
+    ]);
+
+    const covers = new Map<string, string>();
+    for (const block of sitemap.split("<url>")) {
+      const slug = (block.match(/\/series\/([^<]+)<\/loc>/) || [])[1];
+      const cover = (block.match(/<image:loc>([^<]+)<\/image:loc>/) || [])[1];
+      if (slug && cover && !covers.has(slug)) covers.set(decodeURIComponent(slug), cover);
+    }
+
+    const titles: TitleItem[] = [];
+    const seen = new Set<string>();
+    const add = (slug: string, title: string) => {
+      if (!slug || seen.has(slug)) return;
+      seen.add(slug);
+      titles.push({
+        title,
+        url: spectreUrl(SPECTRE_ORIGIN, `/series/${slug}`),
+        sourceId: "specterscans",
+        sourceName: "Spectre Scans",
+        latestChapter: "",
+        totalChapters: 0,
+        thumbnail: covers.get(slug),
+      });
+    };
+
+    const linkRe = /<a[^>]*href="\/series\/([^"]+)"[^>]*>([^<]+)</gi;
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(az)) !== null) add(decodeEntities(m[1]), decodeEntities(m[2]).trim());
+    for (const slug of covers.keys()) add(slug, titleFromSlug(slug));
+    return titles;
+  },
+};
+
 // ── allmanga.to — GraphQL backed ───────────────────────────
 const ALLMANGA_API = "https://api.allanime.day/api";
 
@@ -769,6 +980,7 @@ export const SOURCES: Source[] = [
   dandadana,
   oshino,
   chainsawman,
+  specterscans,
   allmanga,
 ];
 

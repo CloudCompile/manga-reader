@@ -23,9 +23,19 @@ on port 12000.
   and nothing may throw.
 
 ## Site-specific quirks
-- Six supported sources plus mangafragrant. All except allmanga host exactly one
-  series per host, so their browse entry comes from `browseFromListing`
-  (grouped from the listing page), not a catalogue endpoint.
+- Seven supported sources plus mangafragrant. All except allmanga and
+  specterscans host exactly one series per host, so their browse entry comes
+  from `browseFromListing` (grouped from the listing page), not a catalogue
+  endpoint.
+- specterscans.com is the first multi-series catalogue. `fetchList` reads the
+  series page (`/series/<slug>`); `fetchChapter` accepts either a chapter URL
+  or a bare series URL (which it resolves to the newest readable chapter).
+  Page images come from the RSC payload (`"imageUrl"` entries) rather than the
+  `<img>` markup, because lazy pages are not always rendered. Search uses
+  `/api/search?q=`; browse reads `sitemap.xml` (series + covers) joined with
+  `/a-z` for display titles. specterscans.net is the same app under a second
+  host with a different slug set (and images under `cdn.specterscans.net/i/`),
+  so the source matches both hosts and search returns `.net` hits as well.
 - allmanga.to is GraphQL (`api.allanime.day`). A **blank search** (`search: {}`)
   enumerates the catalogue and backs the browse grid. Page images are gated
   behind a captcha, so `fetchChapter` records a `warning` instead of failing.

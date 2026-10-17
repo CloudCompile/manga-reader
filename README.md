@@ -12,6 +12,7 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 | dandadana.com | |
 | readoshino.com | |
 | onlinechainsawmanmanga.us | Origin is frequently offline (HTTP 522) |
+| specterscans.com / specterscans.net | Multi-series catalogue; browse, search, and reader all work |
 | allmanga.to | Chapter lists and search work; page images require solving the site's captcha |
 
 ## Features
