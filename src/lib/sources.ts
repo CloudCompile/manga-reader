@@ -990,8 +990,12 @@ const allmanga: Source = {
     });
   },
   async browse(): Promise<TitleItem[]> {
-    // A blank query enumerates the catalogue, which is how the browse grid is
-    // populated without paging through the site.
+    // A blank query returns the site's newest additions. That feed is a recency
+    // list, not a catalogue: its contents change as titles are uploaded, so this
+    // source contributes a slice of recent releases rather than a stable shelf.
+    // AllManga has no working popularity/browse endpoint (queryPopular returns
+    // no edges and introspection is disabled), so this is the best available
+    // listing. It is kept separate from the curated shelf in the UI.
     const data = await allmangaGql<{ mangas: { edges: AllMangaEdge[] } }>(ALLMANGA_SEARCH_QUERY, {
       search: {},
       limit: 60,
@@ -1172,7 +1176,10 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
       try {
         const results = await source.search(query);
         return results.map((r) => ({ ...r, source: source.name }));
-      } catch {
+      } catch (err) {
+        // Report the failure instead of returning an empty list, which is
+        // indistinguishable from "no matches" to the person searching.
+        console.warn(`Search failed for ${source.name}:`, err instanceof Error ? err.message : err);
         return [];
       }
     }
@@ -1254,50 +1261,90 @@ async function titlesFromListing(source: Source): Promise<TitleItem[]> {
 }
 
 // Every series the reader can open, grouped by source in the UI.
-export async function listTitles(): Promise<TitleItem[]> {
-  const cached = TITLE_CACHE.get("all");
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+//
+// A source that throws is reported in `sources` rather than silently dropped:
+// losing 40 titles with no explanation reads as data loss, so the UI needs to
+// know which source failed in order to offer a retry.
+export interface CatalogueResult {
+  titles: TitleItem[];
+  sources: SourceHealth[];
+}
 
-  const tasks = SOURCES.map(async (source) => {
-    if (source.browse) {
-      try {
-        return await source.browse();
-      } catch {
-        return [];
-      }
-    }
-    if (!source.browseFromListing) return [];
+export interface SourceHealth {
+  id: string;
+  name: string;
+  ok: boolean;
+  count: number;
+  error?: string;
+}
+
+export async function listTitlesWithHealth(): Promise<CatalogueResult> {
+  const tasks = SOURCES.map(async (source): Promise<SourceHealth & { titles: TitleItem[] }> => {
     try {
-      return await titlesFromListing(source);
-    } catch {
-      return [];
+      const titles = source.browse
+        ? await source.browse()
+        : source.browseFromListing
+          ? await titlesFromListing(source)
+          : [];
+      return { id: source.id, name: source.name, ok: true, count: titles.length, titles };
+    } catch (err) {
+      return {
+        id: source.id,
+        name: source.name,
+        ok: false,
+        count: 0,
+        error: err instanceof Error ? err.message : "Source unavailable",
+        titles: [],
+      };
     }
   });
 
-  const settled = await Promise.allSettled(tasks);
+  const settled = await Promise.all(tasks);
   const seen = new Set<string>();
-  const out: TitleItem[] = [];
+  const titles: TitleItem[] = [];
+  const sources: SourceHealth[] = [];
   for (const s of settled) {
-    if (s.status !== "fulfilled") continue;
-    for (const t of s.value) {
+    sources.push({ id: s.id, name: s.name, ok: s.ok, count: s.count, error: s.error });
+    for (const t of s.titles) {
       const key = `${t.sourceId}:${t.url}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push(t);
+      titles.push(t);
     }
   }
-  TITLE_CACHE.set("all", { data: out, ts: Date.now() });
-  return out;
+  return { titles, sources };
+}
+
+export async function listTitles(): Promise<TitleItem[]> {
+  const cached = TITLE_CACHE.get("all");
+  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  const { titles } = await listTitlesWithHealth();
+  TITLE_CACHE.set("all", { data: titles, ts: Date.now() });
+  return titles;
 }
 
 // The home shelf: the hand-picked Spectre titles in CURATED_TITLES order, plus
-// every single-series source (Komi, Blue Box, …) which is always worth showing.
+// the single-series sources (Komi, Blue Box, …) which are always worth showing.
 // Entries the catalogue no longer carries are skipped.
+//
+// AllManga is deliberately excluded. Its listing is a recency feed rather than
+// a catalogue, so its 60 slots would churn every session and crowd out the
+// curated picks. It remains reachable through the full catalogue and search.
+const SHELF_EXCLUDED_SOURCES = new Set(["allmanga"]);
+
 export async function listCuratedTitles(): Promise<TitleItem[]> {
-  const all = await listTitles();
+  const { titles } = await listCuratedTitlesWithHealth();
+  return titles;
+}
+
+// The shelf also reports source health, so a source that failed while building
+// it is visible on the default view and not only in the full catalogue.
+export async function listCuratedTitlesWithHealth(): Promise<CatalogueResult> {
+  const { titles: all, sources } = await listTitlesWithHealth();
   const bySlug = new Map<string, TitleItem>();
   const standalone: TitleItem[] = [];
   for (const t of all) {
+    if (SHELF_EXCLUDED_SOURCES.has(t.sourceId)) continue;
     if (t.sourceId === "specterscans") {
       bySlug.set(t.url.replace(/\/$/, "").split("/").pop() || "", t);
     } else {
@@ -1309,7 +1356,9 @@ export async function listCuratedTitles(): Promise<TitleItem[]> {
     const t = bySlug.get(slug);
     if (t) out.push(t);
   }
-  return out.concat(standalone);
+  // Stable ordering keeps the shelf from reshuffling between loads.
+  standalone.sort((a, b) => a.title.localeCompare(b.title));
+  return { titles: out.concat(standalone), sources };
 }
 
 // ───────────────────────────────────────────────────────────

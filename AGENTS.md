@@ -37,9 +37,12 @@ on port 12000.
   host with a different slug set (and images under `cdn.specterscans.net/i/`),
   so the source matches both hosts and search returns `.net` hits as well.
 - allmanga.to is GraphQL (`api.allanime.day`). A **blank search** (`search: {}`)
-  enumerates the catalogue and backs the browse grid. Page images are gated
-  behind a captcha, so `fetchChapter` records a `warning` instead of failing.
-  Cover paths like `mcovers/...` are relative to `https://cdn.allanime.day/`.
+  returns the newest additions, which is a *recency feed*, not a catalogue: its
+  contents change between sessions. There is no working popularity/browse
+  endpoint (`queryPopular` needs a non-null `type`+`size`, returns `total: 500`
+  but no edges, and introspection is disabled). Page images are gated behind a
+  captcha, so `fetchChapter` records a `warning` instead of failing. Cover paths
+  like `mcovers/...` are relative to `https://cdn.allanime.day/`.
 - Several sites leave the *newest* chapter as an empty placeholder ("coming
   soon"). Opening a title therefore probes the top few chapters for images
   before settling — do not assume chapter #1/newest is readable.
@@ -55,14 +58,47 @@ states that not every chapter gets a volume.
 
 ## Home shelf
 
-`/api/titles` returns the shelf: the hand-picked Spectre titles
-(`CURATED_TITLES` in `src/lib/sources.ts`) followed by every single-series
-source (Komi, Blue Box, Dandadan, Oshi No Ko, MangaFragrant), which is always
-kept. Pass `?all=1` for the full catalogue. The shelf grid renders covers
-through `/api/proxy` rather than hotlinking the CDN, so a blocked or dead
-cover degrades to the placeholder icon instead of a broken image. Spectre
-Scans' sitemap lists a few covers whose filenames contain a colon; the CDN
-does not serve those, so they are dropped at listing time.
+`/api/titles` returns the shelf by default: the hand-picked Spectre titles
+(`CURATED_TITLES` in `src/lib/sources.ts`) followed by the single-series sources
+(Komi, Blue Box, Dandadan, Oshi No Ko, MangaFragrant), which are always kept.
+AllManga is excluded from the shelf (`SHELF_EXCLUDED_SOURCES`) because its
+listing churns; it stays reachable through the full catalogue and search. The
+shelf grid renders covers through `/api/proxy` rather than hotlinking the CDN,
+so a blocked or dead cover degrades to the placeholder icon instead of a broken
+image. Spectre Scans' sitemap lists a few covers whose filenames contain a
+colon; the CDN does not serve those, so they are dropped at listing time.
+
+Pass `?all=1` for the full catalogue (~1200 titles), which pages server-side via
+`offset` (60 per page) and filters by `source` and `q` on the server. The UI's
+scope tabs pick between the two: the shelf filters in place, the catalogue
+refetches (debounced 250 ms) so the search box searches all ~1200 titles rather
+than only the fetched page.
+
+`listTitlesWithHealth` returns `{ titles, sources }`; `sources` reports every
+registered source with `ok`/`count`/`error` instead of silently dropping the
+ones that threw, and the shelf surfaces the failures with a retry. A registered
+source with `count: 0` (currently `chainsawman`) means its listing loaded but
+yielded no titles — that is health, not an exception.
+
+## Errors and reader interaction
+
+Failures show as a `Banner` (`banner` state) layered over the current view
+rather than replacing it, so a dead cover or a bad URL never costs the reader
+their place. Errors auto-dismiss after 8 s, info after 4 s. There is no
+full-page error screen.
+
+Clicking the page area scrolls one screen down; only at the last page does it
+move to the next chapter, and a click is ignored while text is selected. On
+touch, a mostly-horizontal swipe (>60 px, 1.5× the vertical delta) changes
+chapter. Both are documented in the shortcuts panel.
+
+## Accessibility conventions
+
+Icon-only buttons carry `aria-label` (not just `title`), toggles carry
+`aria-pressed`, the scope tabs use `role="tablist"`/`aria-selected`, and
+hand-rolled buttons carry `focus-visible:outline`. New icon buttons should
+follow suit. Bars pad for notches with `env(safe-area-inset-*)`, and mobile
+controls use `p-2.5` tap targets rather than `p-1.5`.
 
 ## Reader and theming
 
