@@ -59,6 +59,7 @@ export interface TitleItem {
 
 // Titles featured on the home shelf, in display order. These are Spectre Scans
 // series slugs; the shelf only renders entries the catalogue actually returns.
+// The single-series sources (Komi, Blue Box, …) are always kept as well.
 export const CURATED_TITLES: string[] = [
   "berserk",
   "koe-no-katachi",
@@ -75,6 +76,31 @@ export const CURATED_TITLES: string[] = [
   "claymore",
   "yotsubato",
   "made-in-abyss",
+  "one-piece",
+  "naruto",
+  "death-note",
+  "fullmetal-alchemist",
+  "shingeki-no-kyojin",
+  "boku-no-hero-academia",
+  "tokyo-revengers",
+  "spy-x-family",
+  "sakamoto-days",
+  "dandadan",
+  "fire-punch",
+  "the-promised-neverland",
+  "dr-stone",
+  "mob-psycho100",
+  "golden-kamui",
+  "i-am-a-hero",
+  "homunculus",
+  "beck",
+  "ouran-high-school-host-club",
+  "horimiya",
+  "yagate-kimi-ni-naru",
+  "kanojo-okarishimasu",
+  "blue-period",
+  "3-gatsu-no-lion",
+  "fruits-basket",
 ];
 
 interface Source {
@@ -1264,21 +1290,26 @@ export async function listTitles(): Promise<TitleItem[]> {
   return out;
 }
 
-// The home shelf: only the hand-picked titles, in CURATED_TITLES order.
+// The home shelf: the hand-picked Spectre titles in CURATED_TITLES order, plus
+// every single-series source (Komi, Blue Box, …) which is always worth showing.
 // Entries the catalogue no longer carries are skipped.
 export async function listCuratedTitles(): Promise<TitleItem[]> {
   const all = await listTitles();
   const bySlug = new Map<string, TitleItem>();
+  const standalone: TitleItem[] = [];
   for (const t of all) {
-    if (t.sourceId !== "specterscans") continue;
-    bySlug.set(t.url.replace(/\/$/, "").split("/").pop() || "", t);
+    if (t.sourceId === "specterscans") {
+      bySlug.set(t.url.replace(/\/$/, "").split("/").pop() || "", t);
+    } else {
+      standalone.push(t);
+    }
   }
   const out: TitleItem[] = [];
   for (const slug of CURATED_TITLES) {
     const t = bySlug.get(slug);
     if (t) out.push(t);
   }
-  return out;
+  return out.concat(standalone);
 }
 
 // ───────────────────────────────────────────────────────────
