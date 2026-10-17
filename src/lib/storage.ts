@@ -38,6 +38,10 @@ export interface StoredState {
   theme: "dark" | "light";
   fitMode: "width" | "height" | "original";
   wide: boolean;
+  // Reading layout: continuous vertical scroll (the default) or one page per
+  // screen. rtl flips the page-turn direction for right-to-left manga.
+  paged: boolean;
+  rtl: boolean;
 }
 
 interface PackedEntry {
@@ -76,6 +80,8 @@ const DEFAULT_STATE: StoredState = {
   theme: "dark",
   fitMode: "width",
   wide: false,
+  paged: false,
+  rtl: false,
 };
 
 let memoryState: StoredState = { ...DEFAULT_STATE };
@@ -195,6 +201,8 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
           fitMode:
             legacy.fitMode === "height" || legacy.fitMode === "original" ? legacy.fitMode : "width",
           wide: legacy.wide === true,
+          paged: legacy.paged === true,
+          rtl: legacy.rtl === true,
         };
       }
     }
@@ -212,6 +220,8 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
     fitMode:
       settings.fitMode === "height" || settings.fitMode === "original" ? settings.fitMode : "width",
     wide: settings.wide === true,
+    paged: settings.paged === true,
+    rtl: settings.rtl === true,
   };
 }
 
@@ -332,7 +342,13 @@ function persist(state: StoredState): void {
 
   writeCookie(
     SETTINGS_COOKIE,
-    JSON.stringify({ theme: state.theme, fitMode: state.fitMode, wide: state.wide })
+    JSON.stringify({
+      theme: state.theme,
+      fitMode: state.fitMode,
+      wide: state.wide,
+      paged: state.paged,
+      rtl: state.rtl,
+    })
   );
 
   // Keep memory in step with what was actually stored; otherwise the session
@@ -426,6 +442,24 @@ export function getWide(): boolean {
 export function setWide(wide: boolean): void {
   const state = loadState();
   persist({ ...state, wide });
+}
+
+export function getPaged(): boolean {
+  return loadState().paged;
+}
+
+export function setPaged(paged: boolean): void {
+  const state = loadState();
+  persist({ ...state, paged });
+}
+
+export function getRtl(): boolean {
+  return loadState().rtl;
+}
+
+export function setRtl(rtl: boolean): void {
+  const state = loadState();
+  persist({ ...state, rtl });
 }
 
 // Records how far into a chapter the reader got, so it can resume later.

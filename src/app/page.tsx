@@ -28,6 +28,7 @@ import {
   Bookmark,
   BookmarkCheck,
   BookmarkPlus,
+  ArrowLeftRight,
 } from "lucide-react";
 import {
   getHistory,
@@ -40,6 +41,10 @@ import {
   setFitMode as persistFitMode,
   getWide,
   setWide as persistWide,
+  getPaged,
+  setPaged as persistPaged,
+  getRtl,
+  setRtl as persistRtl,
   setPage,
   getList,
   toggleInList,
@@ -154,6 +159,45 @@ function warmPages(chapterUrl: string, images: string[]) {
   }
 }
 
+// Pages warmed ahead of the reader's current position within one chapter.
+// Neighbour-chapter warming above only covers the first screenful; this keeps
+// the next few pages of the *current* chapter decoded so a flick through a long
+// chapter does not hit a blank placeholder at every screen boundary.
+//
+// WARMED_SRCS remembers which source URLs have already been warmed, so
+// scrolling back and forth over a page warms it once. It is capped like the
+// other session caches so a long read cannot grow it without bound.
+const WARMED_SRCS = new Set<string>();
+// Per-chapter count of pages warmed, keyed by the chapter's image array so the
+// cap resets when a different chapter loads and is released with it.
+const WARMED_PER_CHAPTER = new WeakMap<string[], number>();
+const LOOKAHEAD_MAX_ENTRIES = 200;
+// How many pages past the visible one to warm, and how many per chapter.
+const LOOKAHEAD_PAGES = 3;
+const LOOKAHEAD_TOTAL = 12;
+function warmLookahead(images: string[], fromIndex: number) {
+  if (!images.length) return;
+  let warmed = WARMED_PER_CHAPTER.get(images) || 0;
+  if (warmed >= LOOKAHEAD_TOTAL) return;
+  const start = Math.max(0, fromIndex);
+  const end = Math.min(images.length, start + LOOKAHEAD_PAGES + 1);
+  for (let i = start; i < end && warmed < LOOKAHEAD_TOTAL; i++) {
+    const src = images[i];
+    if (!src || WARMED_SRCS.has(src)) continue;
+    WARMED_SRCS.add(src);
+    warmed++;
+    while (WARMED_SRCS.size > LOOKAHEAD_MAX_ENTRIES) {
+      const oldest = WARMED_SRCS.values().next().value;
+      if (oldest === undefined) break;
+      WARMED_SRCS.delete(oldest);
+    }
+    const img = new Image();
+    img.decoding = "async";
+    img.src = PROXY(src);
+  }
+  WARMED_PER_CHAPTER.set(images, warmed);
+}
+
 // ─── Component ───────────────────────────────────────
 export default function MangaReader() {
   const [url, setUrl] = useState("");
@@ -164,6 +208,8 @@ export default function MangaReader() {
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [theme, setTheme] = useState<Theme>("dark");
   const [fitMode, setFitMode] = useState<FitMode>("width");
+  const [paged, setPaged] = useState(false);
+  const [rtl, setRtl] = useState(false);
   const [loadedImages, setLoadedImages] = useState<Set<number>>(new Set());
   const [chapters, setChapters] = useState<ChapterItem[]>([]);
   const [volumes, setVolumes] = useState<string[]>([]);
@@ -208,6 +254,9 @@ export default function MangaReader() {
   const resumeRef = useRef<{ url: string; page: number } | null>(null);
   const lastPageSaved = useRef(0);
   const lastScrollY = useRef(0);
+  // Read by the scroll handler, which is registered once per chapter and so
+  // cannot close over the current value of `paged`.
+  const pagedRef = useRef(false);
   const scrollEnd = useRef<number | null>(null);
 
   // Init
@@ -218,6 +267,8 @@ export default function MangaReader() {
     setTheme(getTheme());
     setFitMode(getFitMode());
     setWide(getWide());
+    setPaged(getPaged());
+    setRtl(getRtl());
     setReadingList(getList());
   }, []);
 
@@ -322,6 +373,9 @@ export default function MangaReader() {
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
+      // In paged mode there is nothing to scroll: currentPage is driven by
+      // turnPage instead, so the scroll bookkeeping below does not apply.
+      if (pagedRef.current) return;
       const y = el.scrollTop;
       setShowScrollTop(y > 600);
 
@@ -335,6 +389,10 @@ export default function MangaReader() {
         const rect = imgs[i].getBoundingClientRect();
         if (rect.top >= -rect.height / 2) {
           setCurrentPage(i + 1);
+          // Warm the pages just past the visible one so the next screenful is
+          // ready before the reader reaches it.
+          const current = dataRef.current;
+          if (current) warmLookahead(current.images, i);
           break;
         }
       }
@@ -366,16 +424,51 @@ export default function MangaReader() {
   // Set initial page to 1 when data loads
   useEffect(() => { if (data?.images.length) setCurrentPage(1); }, [data?.images.length]);
 
+  // Keep the ref the scroll handler reads in step with the toggle.
+  useEffect(() => { pagedRef.current = paged; }, [paged]);
+
+  // In paged mode, record the page reached as it changes. The scroll handler
+  // does this for the scrolling reader, but it is inert here.
+  useEffect(() => {
+    if (!paged || !data?.images.length || !currentUrlRef.current) return;
+    if (currentPage > lastPageSaved.current) {
+      lastPageSaved.current = currentPage;
+      setPage(currentUrlRef.current, currentPage);
+      setHistory(getHistory());
+    }
+  }, [paged, currentPage, data]);
+
+  // Warm the opening pages of a freshly loaded chapter so the first screenful
+  // paints without waiting, matching what the scroll handler does further down.
+  useEffect(() => {
+    if (data?.images.length) warmLookahead(data.images, 0);
+  }, [data]);
+
+  // In paged mode the scroll handler never fires, so warm ahead from the page
+  // being shown instead; this keeps the next turn instant.
+  useEffect(() => {
+    if (paged && data?.images.length) warmLookahead(data.images, currentPage - 1);
+  }, [paged, currentPage, data]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "ArrowLeft" && data?.prevUrl) {
+      const isLeft = e.key === "ArrowLeft";
+      const isRight = e.key === "ArrowRight";
+      if (isLeft || isRight) {
         e.preventDefault();
-        goToChapter(data.prevUrl);
-      } else if (e.key === "ArrowRight" && data?.nextUrl) {
-        e.preventDefault();
-        goToChapter(data.nextUrl);
+        if (paged) {
+          // In paged mode the arrows turn pages within the chapter before they
+          // leave it. In RTL "forward" is the left arrow.
+          const forward = rtl ? isLeft : isRight;
+          if (forward) advance();
+          else retreat();
+        } else if (isLeft && data?.prevUrl) {
+          goToChapter(data.prevUrl);
+        } else if (isRight && data?.nextUrl) {
+          goToChapter(data.nextUrl);
+        }
       } else if (e.key === "t" || e.key === "T") {
         toggleTheme();
       } else if (e.key === "l" || e.key === "L") {
@@ -402,7 +495,7 @@ export default function MangaReader() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [data]);
+  }, [data, paged, currentPage, rtl, wide]);
 
   // Warm the neighbouring chapters after the current one settles, so Prev/Next
   // does not wait on a scrape. Runs at most once per chapter and is a no-op if
@@ -609,6 +702,8 @@ export default function MangaReader() {
 
   const chooseFitMode = (mode: FitMode) => { setFitMode(mode); persistFitMode(mode); };
   const toggleWide = () => { const next = !wide; setWide(next); persistWide(next); };
+  const togglePaged = () => { const next = !paged; setPaged(next); persistPaged(next); };
+  const toggleRtl = () => { const next = !rtl; setRtl(next); persistRtl(next); };
   const toggleFullscreen = () => {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     else document.documentElement.requestFullscreen().catch(() => {});
@@ -619,6 +714,14 @@ export default function MangaReader() {
     const pending = resumeRef.current;
     if (!data || !pending || pending.url !== currentUrlRef.current) return;
     if (!data.images.length) return;
+    if (pagedRef.current) {
+      // Nothing is scrollable in paged mode, so restore by selecting the group
+      // rather than by scrolling to the image.
+      setCurrentPage(pending.page);
+      lastPageSaved.current = pending.page;
+      resumeRef.current = null;
+      return;
+    }
     let cancelled = false;
     let tries = 0;
     const attempt = () => {
@@ -698,6 +801,12 @@ export default function MangaReader() {
   // also ignored while text is selected, so copying a line does not navigate.
   const onImageClick = () => {
     if (typeof window !== "undefined" && window.getSelection()?.toString()) return;
+    // In paged mode a click advances one page (or chapter at the end) rather
+    // than nudging the scroll position.
+    if (paged) {
+      advance();
+      return;
+    }
     const atLastPage = totalPages > 0 && currentPage >= totalPages;
     if (atLastPage && data?.nextUrl) {
       goToChapter(data.nextUrl);
@@ -707,8 +816,12 @@ export default function MangaReader() {
   };
 
   const jumpToPage = (page: number) => {
-    const img = imgRefs.current.get(page - 1);
-    if (img) img.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (paged) {
+      setCurrentPage(Math.min(Math.max(1, page), totalPages || 1));
+    } else {
+      const img = imgRefs.current.get(page - 1);
+      if (img) img.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
     setShowPageJumper(false);
     setPageInput("");
   };
@@ -716,6 +829,31 @@ export default function MangaReader() {
   const totalPages = data?.images.length || 0;
   const displayImages = data ? data.images.map(PROXY) : [];
   const isDark = theme === "dark";
+
+  // Paged mode shows one page per screen. Turning past the last page moves to
+  // the next chapter and past the first to the previous one, matching where the
+  // scroll reader's click-to-advance ends up. `dir` is in reading order, so it
+  // always counts up; only the input mapping below flips for rtl.
+  const turnPage = (dir: 1 | -1) => {
+    if (!totalPages) return;
+    // A spread shows two pages, so a turn moves a whole spread rather than one
+    // page; otherwise the second page of the spread would never be reachable.
+    const step = wide ? 2 : 1;
+    const target = currentPage + dir * step;
+    if (target < 1) {
+      if (data?.prevUrl) goToChapter(data.prevUrl);
+      return;
+    }
+    if (target > totalPages) {
+      if (data?.nextUrl) goToChapter(data.nextUrl);
+      return;
+    }
+    setCurrentPage(target);
+  };
+  // In LTR the next page is to the right; in RTL it is to the left, so the
+  // arrows and click zones swap.
+  const advance = () => turnPage(1);
+  const retreat = () => turnPage(-1);
 
   // Distinct sources in the listing. For the full catalogue the health report is
   // authoritative: it is the only way to list a source whose titles all fall on
@@ -795,7 +933,9 @@ export default function MangaReader() {
   // so a 50% cap keeps a two-page spread inside the viewport.
   const wideStyle: React.CSSProperties = wide ? { ...imgStyle, width: "100%" } : imgStyle;
 
-  // Pages grouped for rendering: pairs in wide mode, singles otherwise.
+  // Pages grouped for rendering: pairs in wide mode, singles otherwise. The
+  // pairing applies in paged mode too, so a spread is shown on one screen and
+  // the RTL toggle has something to order.
   const pageGroups: number[][] = [];
   if (data) {
     if (wide) {
@@ -806,6 +946,16 @@ export default function MangaReader() {
       for (let i = 0; i < data.images.length; i++) pageGroups.push([i]);
     }
   }
+  // In paged mode the visible group is derived from currentPage rather than
+  // scrolled to, since nothing is scrollable. currentPage is a page index; the
+  // group containing it is the one shown.
+  const groupOf = (pageIndex: number) =>
+    pageGroups.findIndex((g) => g.includes(pageIndex));
+  const pagedGroupIndex = paged ? groupOf(currentPage - 1) : -1;
+  const pagedGroup =
+    paged && pageGroups.length
+      ? pageGroups[pagedGroupIndex >= 0 ? pagedGroupIndex : 0]
+      : null;
 
   // ─── Sidebar panel component ─────────────────────
   const SidePanel = ({ title, icon, show, onClose, children }: {
@@ -898,7 +1048,11 @@ export default function MangaReader() {
 
   // ─── Landing ────────────────────────────────────────
   if (!data) {
-    const continueEntry = history.find((h) => h.page && h.page > 1) || history[0];
+    // Chapters the reader actually opened, most recent first. Previously this
+    // was `history.find(h => h.page > 1) || history[0]`, which picked whichever
+    // entry happened to have a saved page rather than the one last read, so the
+    // headline could point at an older chapter than the one just closed.
+    const recentChapters = history.slice(0, 4);
     return (
       <div className={`min-h-screen flex flex-col ${bg} ${textCol}`}>
         {BannerView}
@@ -946,21 +1100,43 @@ export default function MangaReader() {
               )}
             </div>
 
-            {/* Continue reading */}
-            {continueEntry && !titleQuery && (
-              <button onClick={() => loadChapter(continueEntry.url)}
-                className={`mt-6 inline-flex items-center gap-3 px-4 py-3 rounded-xl border text-left transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
-                <BookOpen className={`h-5 w-5 shrink-0 ${isDark ? "text-white/70" : "text-gray-500"}`} />
-                <span>
-                  <span className={`block text-xs uppercase tracking-wider ${subText}`}>Continue reading</span>
-                  <span className="block text-sm font-medium">
-                    {continueEntry.mangaName}
-                    {continueEntry.chapterNum && <span className={subText}> · Ch {continueEntry.chapterNum}</span>}
-                    {continueEntry.page ? <span className={subText}> · p{continueEntry.page}</span> : null}
+            {/* Continue reading. The most recently opened chapter is the
+                headline; the rest of the recent chapters sit under it so a
+                reader with several on the go can jump back into any of them. */}
+            {recentChapters.length > 0 && !titleQuery && (
+              <div className="mt-6 max-w-xl mx-auto text-left">
+                <div className="flex items-center justify-between mb-2">
+                  <span className={`text-xs uppercase tracking-wider ${subText}`}>Continue reading</span>
+                  {recentChapters.length > 1 && (
+                    <button onClick={() => setShowHistory(true)} className={`text-xs ${subText} hover:underline`}>See all</button>
+                  )}
+                </div>
+                <button onClick={() => loadChapter(recentChapters[0].url)}
+                  className={`w-full inline-flex items-center gap-3 px-4 py-3 rounded-xl border text-left transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
+                  <BookOpen className={`h-5 w-5 shrink-0 ${isDark ? "text-white/70" : "text-gray-500"}`} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium truncate">
+                      {recentChapters[0].mangaName}
+                      {recentChapters[0].chapterNum && <span className={subText}> · Ch {recentChapters[0].chapterNum}</span>}
+                      {recentChapters[0].page ? <span className={subText}> · p{recentChapters[0].page}</span> : null}
+                    </span>
                   </span>
-                </span>
-                <ChevronRight className={`h-4 w-4 shrink-0 ${subText}`} />
-              </button>
+                  <ChevronRight className={`h-4 w-4 shrink-0 ${subText}`} />
+                </button>
+                {recentChapters.slice(1, 4).map((entry) => (
+                  <button key={entry.url} onClick={() => loadChapter(entry.url)}
+                    className={`w-full mt-1 inline-flex items-center gap-3 px-4 py-2 rounded-lg text-left transition-colors ${hoverBg}`}>
+                    <span className="min-w-0 flex-1">
+                      <span className={`block text-sm truncate ${subText}`}>
+                        {entry.mangaName}
+                        {entry.chapterNum && <span> · Ch {entry.chapterNum}</span>}
+                        {entry.page ? <span> · p{entry.page}</span> : null}
+                      </span>
+                    </span>
+                    <ChevronRight className={`h-3.5 w-3.5 shrink-0 ${subText}`} />
+                  </button>
+                ))}
+              </div>
             )}
 
             {/* URL paste */}
@@ -1146,6 +1322,8 @@ export default function MangaReader() {
             </button>
           ))}
           <button onClick={toggleWide} aria-label="Toggle two-page spread" aria-pressed={wide} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Two-page spread (W)"><Columns2 className="h-4 w-4" /></button>
+          <button onClick={togglePaged} aria-label="Toggle one-page view" aria-pressed={paged} className={`px-2 py-1 rounded text-xs transition-colors ${paged ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="One page at a time"><Columns2 className="h-3.5 w-3.5 inline mr-1 rotate-90" />Paged</button>
+          <button onClick={toggleRtl} aria-label="Toggle right-to-left page order" aria-pressed={rtl} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${rtl ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Right-to-left"><ArrowLeftRight className="h-4 w-4" /></button>
           <button onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Fullscreen (F)">
             {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
           </button>
@@ -1180,6 +1358,12 @@ export default function MangaReader() {
           </button>
           <button onClick={() => { toggleWide(); setShowMobileMenu(false); }} aria-pressed={wide} className={`px-3 py-2 rounded text-xs ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
             <Columns2 className="h-3.5 w-3.5 inline mr-1" />Two-page
+          </button>
+          <button onClick={() => { togglePaged(); setShowMobileMenu(false); }} aria-pressed={paged} className={`px-3 py-2 rounded text-xs ${paged ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
+            <Columns2 className="h-3.5 w-3.5 inline mr-1 rotate-90" />Paged
+          </button>
+          <button onClick={() => { toggleRtl(); setShowMobileMenu(false); }} aria-pressed={rtl} className={`px-3 py-2 rounded text-xs ${rtl ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
+            <ArrowLeftRight className="h-3.5 w-3.5 inline mr-1" />RTL
           </button>
           <button onClick={() => { toggleFullscreen(); setShowMobileMenu(false); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
             {isFullscreen ? <Minimize2 className="h-3.5 w-3.5 inline mr-1" /> : <Maximize2 className="h-3.5 w-3.5 inline mr-1" />}Fullscreen
@@ -1287,8 +1471,8 @@ export default function MangaReader() {
             </div>
           </div>
         )}
-        <div className={`flex flex-col items-center ${wide ? "mx-auto max-w-[1600px]" : ""}`}>
-          {pageGroups.map((group, gi) => (
+        <div className={`flex flex-col items-center ${wide ? "mx-auto max-w-[1600px]" : ""}`} dir={rtl ? "rtl" : undefined}>
+          {(paged ? (pagedGroup ? [pagedGroup] : []) : pageGroups).map((group, gi) => (
             <div key={gi} className={`w-full flex ${group.length > 1 ? "flex-row justify-center" : "flex-col items-center"}`}>
               {group.map((i) => (
                 <div key={i} className="relative w-full" style={i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : undefined}>
@@ -1300,7 +1484,11 @@ export default function MangaReader() {
                   <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
                     src={displayImages[i]} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
                     style={{ ...wideStyle, display: loadedImages.has(i) ? "block" : "none" }}
-                    loading={i < 3 ? "eager" : "lazy"} />
+                    // Paged mode renders only the visible page, so its index can
+                    // be any number; it must load eagerly or the lazy heuristic
+                    // would leave a blank page until it scrolls into view, which
+                    // never happens here.
+                    loading={paged || i < 3 ? "eager" : "lazy"} />
                 </div>
               ))}
             </div>
@@ -1316,9 +1504,20 @@ export default function MangaReader() {
         </Button>
 
         <div className="flex items-center gap-2">
+          {paged && (
+            <button onClick={(e) => { e.stopPropagation(); retreat(); }} aria-label="Previous page" disabled={currentPage <= 1 && !data.prevUrl} className={`p-1.5 rounded disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`}>
+              {/* In RTL the previous page is to the right, so the icon flips. */}
+              {rtl ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+            </button>
+          )}
           <button onClick={(e) => { e.stopPropagation(); setShowPageJumper(true); }} aria-label={`Jump to page, currently page ${currentPage} of ${totalPages}`} className={`px-2 py-1.5 rounded text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`}>
             {currentPage}/{totalPages}
           </button>
+          {paged && (
+            <button onClick={(e) => { e.stopPropagation(); advance(); }} aria-label="Next page" disabled={currentPage >= totalPages && !data.nextUrl} className={`p-1.5 rounded disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`}>
+              {rtl ? <ChevronLeft className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+            </button>
+          )}
         </div>
 
         <Button variant="ghost" size="sm" disabled={!data.nextUrl} aria-label="Next chapter" onClick={(e) => { e.stopPropagation(); goToChapter(data.nextUrl); }}>
@@ -1345,7 +1544,7 @@ export default function MangaReader() {
             </div>
             <dl className="space-y-2 text-sm">
               {[
-                ["← / →", "Previous / next chapter"],
+                ["← / →", paged ? "Previous / next page" : "Previous / next chapter"],
                 ["G", "Jump to page"],
                 ["L", "Chapter list"],
                 ["S", "Save to reading list"],
@@ -1362,14 +1561,16 @@ export default function MangaReader() {
               ))}
             </dl>
             <p className={`text-[10px] mt-4 ${subText}`}>
-              Click the page area to scroll down; at the last page it moves to the next chapter. On a touch screen, swipe left or right to change chapter.
+              {paged
+                ? "Click the page to turn it; at the last page it moves to the next chapter. Turn on RTL for right-to-left manga."
+                : "Click the page area to scroll down; at the last page it moves to the next chapter. On a touch screen, swipe left or right to change chapter."}
             </p>
           </div>
         </div>
       )}
 
       {/* Scroll to top */}
-      {showScrollTop && (
+      {showScrollTop && !paged && (
         <button onClick={(e) => { e.stopPropagation(); scrollToTop(); }}
           className={`fixed bottom-20 right-4 p-2.5 rounded-full shadow-lg transition-all z-30 ${isDark ? "bg-white/10 hover:bg-white/20 text-white" : "bg-white hover:bg-gray-100 text-gray-900 border"}`}
           aria-label="Scroll to top"><ArrowUp className="h-5 w-5" /></button>
