@@ -864,6 +864,10 @@ const specterscans: Source = {
   name: "Spectre Scans",
   hosts: [/specterscans\.(?:com|net)$/i],
   seriesKey: spectreSlug,
+  // Its parsers work off the RSC payload rather than plain markup, so they are
+  // exposed here for the fixture tests instead of going through fetchChapter.
+  parseChapter: spectreChapterFromHtml,
+  parseList: (html, url) => spectreChapterLinks(html, spectreSlug(url), spectreSeriesUrl(url)),
   async fetchChapter(url): Promise<RawChapter> {
     // A series URL (from search or browse) resolves to its newest readable
     // chapter; the newest entry is sometimes an empty placeholder.
@@ -1654,3 +1658,62 @@ async function applyVolumes(
   vols.sort((a, b) => Number(a) - Number(b));
   return vols;
 }
+
+// ───────────────────────────────────────────────────────────
+// Live source health
+// ───────────────────────────────────────────────────────────
+//
+// The fixture tests above run against captured pages, so they catch a parser
+// regression but not a site that has moved, gone offline, or started serving a
+// different series. This opens one real chapter per source and reports whether
+// it still yields pages, so a scheduled job can flag rot before a reader hits
+// it. Each entry is a chapter that was known to work when the check was added.
+
+export interface HealthProbe {
+  id: string;
+  url: string;
+}
+
+// AllManga is deliberately absent: its page images require solving a captcha in
+// a browser, so a server-side check can only ever see zero pages for it. Its
+// reachability is still covered by the GraphQL list call the reader makes.
+export const HEALTH_PROBES: HealthProbe[] = [
+  { id: "ffb", url: "https://thefragrantflowerbloomswithdignity.com/the-fragrant-flower-blooms-with-dignity-manga-chapter-191/" },
+  { id: "mangafragrant", url: "https://mangafragrant.com/manga/the-fragrant-flower-blooms-with-dignity-chapter-182/" },
+  { id: "komic", url: "https://komicantcommunicatechapters.website/manga/komi-cant-communicate-chapter-300/" },
+  { id: "bluebox", url: "https://blue-box-manga.online/comic/blue-box-chapter-250/" },
+  { id: "dandadana", url: "https://dandadana.com/manga/dandadan-chapter-248/" },
+  { id: "oshino", url: "https://readoshino.com/manga/oshi-no-ko-chapter-166/" },
+  { id: "chainsawman", url: "https://onlinechainsawmanmanga.us/chainsaw-man-chapter-2/" },
+  { id: "specterscans", url: "https://specterscans.com/series/boku-no-kokoro-no-yabai-yatsu/chapter/199" },
+];
+
+export interface HealthResult {
+  id: string;
+  url: string;
+  ok: boolean;
+  images: number;
+  // Why the probe failed, when it did.
+  error?: string;
+}
+
+export async function checkSourceHealth(probe: HealthProbe): Promise<HealthResult> {
+  try {
+    const data = await scrapeChapter(probe.url);
+    const ok = data.images.length > 0;
+    return {
+      id: probe.id,
+      url: probe.url,
+      ok,
+      images: data.images.length,
+      error: ok ? undefined : "no page images found",
+    };
+  } catch (e) {
+    return { id: probe.id, url: probe.url, ok: false, images: 0, error: (e as Error).message };
+  }
+}
+
+export async function checkAllSources(): Promise<HealthResult[]> {
+  return Promise.all(HEALTH_PROBES.map(checkSourceHealth));
+}
+

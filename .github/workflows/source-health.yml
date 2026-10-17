@@ -1,0 +1,24 @@
+name: Source health
+
+# Opens one real chapter per source and fails when one stops returning pages.
+# The fixture tests in CI cannot catch a site going offline or changing hands,
+# so this runs on a schedule and on demand. A failure here is a signal to look
+# at a source, not a broken build.
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check-sources
