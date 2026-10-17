@@ -57,6 +57,26 @@ export interface TitleItem {
   thumbnail?: string;
 }
 
+// Titles featured on the home shelf, in display order. These are Spectre Scans
+// series slugs; the shelf only renders entries the catalogue actually returns.
+export const CURATED_TITLES: string[] = [
+  "berserk",
+  "koe-no-katachi",
+  "oshi-no-ko",
+  "bleach",
+  "vinland-saga",
+  "jujutsu-kaisen",
+  "blue-lock",
+  "solo-leveling",
+  "tower-of-god",
+  "chainsaw-man",
+  "holyland",
+  "blame",
+  "claymore",
+  "yotsubato",
+  "made-in-abyss",
+];
+
 interface Source {
   id: string;
   name: string;
@@ -754,6 +774,10 @@ const specterscans: Source = {
     const add = (slug: string, title: string) => {
       if (!slug || seen.has(slug)) return;
       seen.add(slug);
+      const cover = covers.get(slug);
+      // A handful of sitemap covers point at filenames containing a colon,
+      // which the CDN does not serve; drop those rather than show a broken img.
+      const coverFile = cover ? decodeURIComponent(cover.split("/").pop() || "") : "";
       titles.push({
         title,
         url: spectreUrl(SPECTRE_ORIGIN, `/series/${slug}`),
@@ -761,7 +785,7 @@ const specterscans: Source = {
         sourceName: "Spectre Scans",
         latestChapter: "",
         totalChapters: 0,
-        thumbnail: covers.get(slug),
+        thumbnail: cover && !coverFile.includes(":") ? cover : undefined,
       });
     };
 
@@ -1237,6 +1261,23 @@ export async function listTitles(): Promise<TitleItem[]> {
     }
   }
   TITLE_CACHE.set("all", { data: out, ts: Date.now() });
+  return out;
+}
+
+// The home shelf: only the hand-picked titles, in CURATED_TITLES order.
+// Entries the catalogue no longer carries are skipped.
+export async function listCuratedTitles(): Promise<TitleItem[]> {
+  const all = await listTitles();
+  const bySlug = new Map<string, TitleItem>();
+  for (const t of all) {
+    if (t.sourceId !== "specterscans") continue;
+    bySlug.set(t.url.replace(/\/$/, "").split("/").pop() || "", t);
+  }
+  const out: TitleItem[] = [];
+  for (const slug of CURATED_TITLES) {
+    const t = bySlug.get(slug);
+    if (t) out.push(t);
+  }
   return out;
 }
 

@@ -52,3 +52,12 @@ chapters, >= 25% coverage, >= 2 volumes); reprints/doujinshi are excluded.
 When the gate fails, `volumes` is `undefined` and the UI hides the toggle
 rather than showing invented groupings. MangaDex coverage is patchy, so the UI
 states that not every chapter gets a volume.
+
+## Home shelf
+
+`/api/titles` returns only the hand-picked shelf (`CURATED_TITLES` in
+`src/lib/sources.ts`); pass `?all=1` for the full catalogue. The shelf grid
+renders covers through `/api/proxy` rather than hotlinking the CDN, so a
+blocked or dead cover degrades to the placeholder icon instead of a broken
+image. Spectre Scans' sitemap lists a few covers whose filenames contain a
+colon; the CDN does not serve those, so they are dropped at listing time.

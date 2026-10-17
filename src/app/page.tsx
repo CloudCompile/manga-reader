@@ -442,10 +442,10 @@ export default function MangaReader() {
           )}
 
           {/* Browse titles */}
-          <div className="w-full max-w-5xl pb-6">
+          <div className="w-full max-w-5xl pb-6 mx-auto">
             <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
               <h3 className={`text-xs font-semibold uppercase tracking-wider flex items-center gap-2 ${subText}`}>
-                <Library className="h-4 w-4" /> All titles {titles.length ? `(${titles.length})` : ""}
+                <Library className="h-4 w-4" /> Shelf {titles.length ? `(${titles.length})` : ""}
               </h3>
               <div className="flex items-center gap-2 flex-1 justify-end min-w-[240px]">
                 <Input placeholder="Filter by name…" value={titleQuery} onChange={(e) => setTitleQuery(e.target.value)}
@@ -484,7 +484,7 @@ export default function MangaReader() {
                   className={`group text-left rounded-lg overflow-hidden border transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
                   <div className={`relative w-full overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
                     {t.thumbnail ? (
-                      <img src={t.thumbnail} alt="" loading="lazy" className="w-full h-full object-cover" />
+                      <img src={PROXY(t.thumbnail)} alt="" loading="lazy" className="w-full h-full object-cover" />
                     ) : (
                       <div className={`w-full h-full flex items-center justify-center ${subText}`}>
                         <BookOpen className="h-8 w-8" />
