@@ -10,6 +10,25 @@ on port 12000.
 - Build: `npx next build`
 - Run: `npx next start -p 12000` (build first)
 
+## Releases
+Cut a GitHub release at least every 5 commits, so nothing lands without a
+tagged, installable point. Tags are `v0.1.<n>` numbered in commit order; `v0.1.0`
+through `v0.1.20` already cover the initial history back to the first commit.
+Release name is `v0.1.<n> — <commit subject>` and the body is the commit message.
+Publish a release (not a draft) so it is installable from GitHub immediately.
+
+```sh
+# next number = existing release count
+n=$(gh api repos/CloudCompile/manga-reader/releases --paginate -q 'length')
+tag="v0.1.$n"
+sha=$(git rev-parse HEAD)
+gh release create "$tag" --target "$sha" --title "$tag — $(git log -1 --format=%s)" \
+  --notes "$(git log -1 --format=%B)"
+```
+
+If several commits are unreleased, tag the newest and note the range in the
+body rather than skipping the release.
+
 ## Architecture
 - `src/lib/sources.ts` — one `Source` object per site behind a single
   scrape/list/search/browse API. Fetches try direct first, then fall back to the
