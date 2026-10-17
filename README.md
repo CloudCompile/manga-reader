@@ -6,7 +6,8 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 
 | Site | Notes |
 |------|-------|
-| mangafragrant.com | |
+| mangafragrant.com | The Fragrant Flower Blooms with Dignity, back catalogue only (#182 and below); its newer chapters belong to another series |
+| thefragrantflowerbloomswithdignity.com | The Fragrant Flower Blooms with Dignity, full series (204 chapters + .5 extras) |
 | komicantcommunicatechapters.website | |
 | blue-box-manga.online | |
 | dandadana.com | |
