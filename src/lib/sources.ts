@@ -99,6 +99,7 @@ export const CURATED_TITLES: string[] = [
   "ouran-high-school-host-club",
   "horimiya",
   "yagate-kimi-ni-naru",
+  "boku-no-kokoro-no-yabai-yatsu",
   "kanojo-okarishimasu",
   "blue-period",
   "3-gatsu-no-lion",

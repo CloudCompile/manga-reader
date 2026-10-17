@@ -25,6 +25,9 @@ import {
   Minimize2,
   Keyboard,
   Columns2,
+  Bookmark,
+  BookmarkCheck,
+  BookmarkPlus,
 } from "lucide-react";
 import {
   getHistory,
@@ -38,6 +41,9 @@ import {
   getWide,
   setWide as persistWide,
   setPage,
+  getList,
+  toggleInList,
+  removeFromList,
   type HistoryEntry,
 } from "@/lib/storage";
 
@@ -108,6 +114,46 @@ type CatalogueScope = "shelf" | "all";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
+// Chapter payloads fetched ahead of time, keyed by chapter URL. Session-only:
+// this is a latency optimisation, not storage, so it is deliberately not
+// persisted and is dropped when the tab goes away.
+const PREFETCHED_CHAPTERS = new Map<string, ChapterData>();
+const PREFETCH_LIMIT = 4;
+// Both of the caches below live for the session only. Cap them so a long read
+// through a big series cannot grow the tab's memory without bound.
+const PREFETCH_MAX_ENTRIES = 12;
+const WARM_MAX_ENTRIES = 24;
+
+function cacheChapter(chapterUrl: string, json: ChapterData) {
+  PREFETCHED_CHAPTERS.delete(chapterUrl);
+  PREFETCHED_CHAPTERS.set(chapterUrl, json);
+  while (PREFETCHED_CHAPTERS.size > PREFETCH_MAX_ENTRIES) {
+    const oldest = PREFETCHED_CHAPTERS.keys().next().value;
+    if (oldest === undefined) break;
+    PREFETCHED_CHAPTERS.delete(oldest);
+  }
+}
+
+// Chapters whose opening pages have already been warmed through the proxy.
+// Warming the first screenful means Prev/Next paints immediately instead of
+// starting from an empty placeholder.
+const WARMED_CHAPTERS = new Set<string>();
+const WARM_PAGES = 3;
+function warmPages(chapterUrl: string, images: string[]) {
+  if (WARMED_CHAPTERS.has(chapterUrl)) return;
+  WARMED_CHAPTERS.add(chapterUrl);
+  while (WARMED_CHAPTERS.size > WARM_MAX_ENTRIES) {
+    const oldest = WARMED_CHAPTERS.values().next().value;
+    if (oldest === undefined) break;
+    WARMED_CHAPTERS.delete(oldest);
+  }
+  for (const src of images.slice(0, WARM_PAGES)) {
+    const img = new Image();
+    img.decoding = "async";
+    img.src = PROXY(src);
+  }
+}
+
 // ─── Component ───────────────────────────────────────
 export default function MangaReader() {
   const [url, setUrl] = useState("");
@@ -140,6 +186,11 @@ export default function MangaReader() {
   const [titleSource, setTitleSource] = useState("all");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [readingList, setReadingList] = useState<HistoryEntry[]>([]);
+  // Derived rather than tracked in its own state, so it is already correct when
+  // a saved chapter is reopened and when an entry is removed from the panel.
+  const savedHere = readingList.some((e) => e.url === url);
+  const [showSaved, setShowSaved] = useState(false);
   const [currentPage, setCurrentPage] = useState(0);
   const [pageInput, setPageInput] = useState("");
   const [showPageJumper, setShowPageJumper] = useState(false);
@@ -167,6 +218,7 @@ export default function MangaReader() {
     setTheme(getTheme());
     setFitMode(getFitMode());
     setWide(getWide());
+    setReadingList(getList());
   }, []);
 
   // Catalogue loader. "shelf" is the small curated set that paints fast;
@@ -328,6 +380,8 @@ export default function MangaReader() {
         toggleTheme();
       } else if (e.key === "l" || e.key === "L") {
         setShowChapters((v) => !v);
+      } else if (e.key === "s" || e.key === "S") {
+        toggleSaved();
       } else if (e.key === "w" || e.key === "W") {
         toggleWide();
       } else if (e.key === "f" || e.key === "F") {
@@ -338,6 +392,7 @@ export default function MangaReader() {
         setShowChapters(false);
         setShowSearch(false);
         setShowHistory(false);
+        setShowSaved(false);
         setShowPageJumper(false);
         setShowMobileMenu(false);
         setShowShortcuts(false);
@@ -348,6 +403,41 @@ export default function MangaReader() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [data]);
+
+  // Warm the neighbouring chapters after the current one settles, so Prev/Next
+  // does not wait on a scrape. Runs at most once per chapter and is a no-op if
+  // that chapter is already cached.
+  useEffect(() => {
+    const candidates = [data?.nextUrl, data?.prevUrl].filter(
+      (u): u is string => typeof u === "string" && u.length > 0 && !PREFETCHED_CHAPTERS.has(u)
+    );
+    if (!candidates.length) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      for (const target of candidates.slice(0, PREFETCH_LIMIT)) {
+        fetch("/api/scrape", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: target }),
+        })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((json: ChapterData | null) => {
+            if (!cancelled && json && Array.isArray(json.images)) {
+              cacheChapter(target, json);
+              warmPages(target, json.images);
+            }
+          })
+          .catch(() => {
+            // Prefetching is best-effort; a failure just means the chapter loads
+            // on demand as before.
+          });
+      }
+    }, 1200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [data?.nextUrl, data?.prevUrl]);
 
   const handleImageLoad = useCallback((index: number) => {
     setLoadedImages((prev) => new Set(prev).add(index));
@@ -374,13 +464,23 @@ export default function MangaReader() {
     resumeRef.current = prior?.page && prior.page > 1 ? { url: chapterUrl, page: prior.page } : null;
 
     try {
-      const res = await fetch("/api/scrape", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: chapterUrl }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Failed to load chapter");
+      // A prefetched payload skips the round trip entirely. Drop it on use so a
+      // later visit re-reads the chapter rather than serving a stale copy.
+      const prefetched = PREFETCHED_CHAPTERS.get(chapterUrl);
+      PREFETCHED_CHAPTERS.delete(chapterUrl);
+      let json: ChapterData;
+      if (prefetched) {
+        json = prefetched;
+      } else {
+        const res = await fetch("/api/scrape", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: chapterUrl }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || "Failed to load chapter");
+        json = body;
+      }
       dataRef.current = json;
       setData(json);
       setHistory(
@@ -496,6 +596,17 @@ export default function MangaReader() {
     setTheme(next);
     persistTheme(next);
   };
+  const toggleSaved = () => {
+    if (!data) return;
+    const next = toggleInList({
+      url: url,
+      mangaName: data.mangaName,
+      chapterNum: data.chapterNum,
+      timestamp: Date.now(),
+    });
+    setReadingList(next);
+  };
+
   const chooseFitMode = (mode: FitMode) => { setFitMode(mode); persistFitMode(mode); };
   const toggleWide = () => { const next = !wide; setWide(next); persistWide(next); };
   const toggleFullscreen = () => {
@@ -721,6 +832,47 @@ export default function MangaReader() {
   // ─── Banner ────────────────────────────────────────
   // A dismissible message layered over the current view rather than replacing
   // it, so a failed action never costs the reader their place.
+  // Reading history and the reading list are reachable from both the library
+  // and the reader, so they are defined once and rendered in both views.
+  const LibraryPanelsView = (
+    <>
+      <SidePanel title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
+        <div className="p-4 space-y-1">
+          {history.length === 0 && <p className={`text-sm ${subText}`}>No history yet</p>}
+          {history.map((h) => (
+            <button key={h.url} onClick={() => { loadChapter(h.url); setShowHistory(false); }}
+              className={`w-full text-left px-3 py-2 rounded-lg text-sm ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
+              <div className="font-medium">{h.mangaName}</div>
+              <div className={`text-xs ${subText}`}>
+                Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""} · {new Date(h.timestamp).toLocaleDateString()}
+              </div>
+            </button>
+          ))}
+        </div>
+      </SidePanel>
+
+      <SidePanel title="Reading List" icon={<Bookmark className="h-4 w-4" />} show={showSaved} onClose={() => setShowSaved(false)}>
+        <div className="p-4 space-y-1">
+          {readingList.length === 0 && (
+            <p className={`text-sm ${subText}`}>Nothing saved yet. Open a chapter and tap the bookmark to keep it here.</p>
+          )}
+          {readingList.map((h) => (
+            <div key={h.url} className={`flex items-center gap-1 rounded-lg ${hoverBg}`}>
+              <button onClick={() => { loadChapter(h.url); setShowSaved(false); }}
+                className={`flex-1 min-w-0 text-left px-3 py-2 text-sm ${isDark ? "text-white/80" : "text-gray-700"}`}>
+                <div className="font-medium truncate">{h.mangaName}</div>
+                <div className={`text-xs ${subText}`}>Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""}</div>
+              </button>
+              <button onClick={() => setReadingList(removeFromList(h.url))}
+                aria-label={`Remove ${h.mangaName} chapter ${h.chapterNum} from the reading list`}
+                className={`p-2 mr-1 rounded ${subText} ${hoverBg}`} title="Remove"><X className="h-4 w-4" /></button>
+            </div>
+          ))}
+        </div>
+      </SidePanel>
+    </>
+  );
+
   const BannerView = banner ? (
     <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[60] w-[min(92vw,32rem)]" role="status" aria-live="polite">
       <div className={`flex items-start gap-3 rounded-lg border px-4 py-3 shadow-xl ${isDark ? "bg-[#1a1a1a] border-white/15 text-white" : "bg-white border-gray-300 text-gray-900"}`}>
@@ -759,6 +911,7 @@ export default function MangaReader() {
           <div className="flex items-center gap-2">
             <button onClick={() => setShowSearch(true)} aria-label="Search manga" className={`p-2 rounded ${subText} ${hoverBg}`} title="Search manga"><Search className="h-5 w-5" /></button>
             <button onClick={() => setShowHistory(true)} aria-label="Reading history" className={`p-2 rounded ${subText} ${hoverBg}`} title="History"><History className="h-5 w-5" /></button>
+            <button onClick={() => setShowSaved(true)} aria-label="Reading list" className={`p-2 rounded ${subText} ${hoverBg}`} title="Reading list"><Bookmark className="h-5 w-5" /></button>
             <button onClick={toggleTheme} aria-label="Toggle colour theme" className={`p-2 rounded ${subText} ${hoverBg}`} title="Toggle theme">
               {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </button>
@@ -930,7 +1083,7 @@ export default function MangaReader() {
 
           {/* Keyboard shortcuts hint */}
           <div className={`text-xs ${subText} text-center space-y-1 pb-6`}>
-            <p>Keyboard shortcuts: <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>←</kbd> <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>→</kbd> chapters · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>T</kbd> theme · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>L</kbd> chapter list · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>?</kbd> all</p>
+            <p>Keyboard shortcuts: <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>←</kbd> <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>→</kbd> chapters · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>T</kbd> theme · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>L</kbd> chapter list · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>S</kbd> save · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>?</kbd> all</p>
           </div>
         </main>
 
@@ -956,20 +1109,7 @@ export default function MangaReader() {
           </div>
         </SidePanel>
 
-        <SidePanel title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
-          <div className="p-4 space-y-1">
-            {history.length === 0 && <p className={`text-sm ${subText}`}>No history yet</p>}
-            {history.map((h) => (
-              <button key={h.url} onClick={() => { loadChapter(h.url); setShowHistory(false); }}
-                className={`w-full text-left px-3 py-2 rounded-lg text-sm ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
-                <div className="font-medium">{h.mangaName}</div>
-                <div className={`text-xs ${subText}`}>
-                  Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""} · {new Date(h.timestamp).toLocaleDateString()}
-                </div>
-              </button>
-            ))}
-          </div>
-        </SidePanel>
+        {LibraryPanelsView}
       </div>
     );
   }
@@ -980,6 +1120,7 @@ export default function MangaReader() {
   return (
     <div className={`h-screen relative flex flex-col ${bg} ${textCol} overflow-hidden`}>
       {BannerView}
+      {LibraryPanelsView}
       {/* Top bar */}
       <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg} z-40 transition-transform duration-300 ${chromeHidden ? "-translate-y-full" : ""}`} style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}>
         <button onClick={() => setShowMobileMenu((v) => !v)} aria-label="Open reader menu" aria-expanded={showMobileMenu} className={`p-2.5 rounded sm:hidden focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${hoverBg}`}><Menu className="h-5 w-5" /></button>
@@ -992,6 +1133,10 @@ export default function MangaReader() {
 
         {/* Desktop buttons */}
         <div className="hidden sm:flex items-center gap-1">
+          <button onClick={toggleSaved} aria-label={savedHere ? "Remove from reading list" : "Add to reading list"} aria-pressed={savedHere} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title={savedHere ? "Saved to reading list (S)" : "Save to reading list (S)"}>
+            {savedHere ? <BookmarkCheck className="h-4 w-4" /> : <BookmarkPlus className="h-4 w-4" />}
+          </button>
+          <button onClick={() => setShowSaved(true)} aria-label="Open reading list" className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Reading list"><Bookmark className="h-4 w-4" /></button>
           <button onClick={() => setShowChapters((v) => !v)} className={`px-2 py-1 rounded text-xs transition-colors ${showChapters ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Chapter list (L)"><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
           <div className={`w-px h-4 mx-1 ${isDark ? "bg-white/10" : "bg-gray-200"}`} />
           {(["width", "height", "original"] as const).map((fm) => (
@@ -1026,6 +1171,13 @@ export default function MangaReader() {
               {fm === "width" ? "Fit Width" : fm === "height" ? "Fit Height" : "Original"}
             </button>
           ))}
+          <button onClick={() => { toggleSaved(); setShowMobileMenu(false); }} aria-pressed={savedHere} className={`px-3 py-2 rounded text-xs ${savedHere ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
+            {savedHere ? <BookmarkCheck className="h-3.5 w-3.5 inline mr-1" /> : <BookmarkPlus className="h-3.5 w-3.5 inline mr-1" />}
+            {savedHere ? "Saved" : "Save"}
+          </button>
+          <button onClick={() => { setShowSaved(true); setShowMobileMenu(false); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
+            <Bookmark className="h-3.5 w-3.5 inline mr-1" />Reading list
+          </button>
           <button onClick={() => { toggleWide(); setShowMobileMenu(false); }} aria-pressed={wide} className={`px-3 py-2 rounded text-xs ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
             <Columns2 className="h-3.5 w-3.5 inline mr-1" />Two-page
           </button>
@@ -1196,6 +1348,7 @@ export default function MangaReader() {
                 ["← / →", "Previous / next chapter"],
                 ["G", "Jump to page"],
                 ["L", "Chapter list"],
+                ["S", "Save to reading list"],
                 ["W", "Two-page spread"],
                 ["F", "Fullscreen"],
                 ["T", "Toggle theme"],
