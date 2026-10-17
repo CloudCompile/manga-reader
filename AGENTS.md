@@ -23,10 +23,27 @@ on port 12000.
   and nothing may throw.
 
 ## Site-specific quirks
-- Seven supported sources plus mangafragrant. All except allmanga and
-  specterscans host exactly one series per host, so their browse entry comes
-  from `browseFromListing` (grouped from the listing page), not a catalogue
+- Eight supported sources. All except allmanga, specterscans and ffb host
+  exactly one series per host, so their browse entry comes from
+  `browseFromListing` (grouped from the listing page), not a catalogue
   endpoint.
+- mangafragrant.com is the original source for The Fragrant Flower Blooms with
+  Dignity, but from #183 up its pages resolve to its "return of" upload folder,
+  which is a different series, and #195 has no images at all. The source is
+  therefore capped at `MANGAFRAGRANT_LAST_GOOD` (182): `parseList` drops the
+  broken range, `parseChapter` throws if the URL is past the cap or the images
+  live under `return of/`, and the #182 "next" link is rewritten to the next
+  chapter on ffb so the reader crosses over instead of landing on another manga.
+  Its homepage (not `/manga/`, which lists only the newest ten) carries the full
+  back catalogue, including side chapters (.5, .2) that ffb lacks.
+- thefragrantflowerbloomswithdignity.com (`ffb`) replaces mangafragrant for the
+  recent chapters. Its URLs are `/<slug>-chapter-<n>` at the site root rather
+  than under `/manga/` or `/comic/`, so the generic slug/number helpers and
+  `chapterLinks` do not apply and the patterns are built explicitly. The chapter
+  list comes from the WordPress REST API (`/wp-json/wp/v2/posts`), because the
+  homepage omits the published-but-unlinked #199. Page images are filtered to
+  the `/wp-content/uploads/manga/<slug>/` path, since the logo and author
+  avatar are served from the same host.
 - specterscans.com is the first multi-series catalogue. `fetchList` reads the
   series page (`/series/<slug>`); `fetchChapter` accepts either a chapter URL
   or a bare series URL (which it resolves to the newest readable chapter).
@@ -60,13 +77,16 @@ states that not every chapter gets a volume.
 
 `/api/titles` returns the shelf by default: the hand-picked Spectre titles
 (`CURATED_TITLES` in `src/lib/sources.ts`) followed by the single-series sources
-(Komi, Blue Box, Dandadan, Oshi No Ko, MangaFragrant), which are always kept.
-AllManga is excluded from the shelf (`SHELF_EXCLUDED_SOURCES`) because its
-listing churns; it stays reachable through the full catalogue and search. The
-shelf grid renders covers through `/api/proxy` rather than hotlinking the CDN,
-so a blocked or dead cover degrades to the placeholder icon instead of a broken
-image. Spectre Scans' sitemap lists a few covers whose filenames contain a
-colon; the CDN does not serve those, so they are dropped at listing time.
+(Komi, Blue Box, Dandadan, Oshi No Ko), which are always kept.
+AllManga and MangaFragrant are excluded from the shelf
+(`SHELF_EXCLUDED_SOURCES`): AllManga's listing churns, and MangaFragrant's
+recent chapters belong to another series, so the shelf would offer a broken
+copy of a title that ffb already carries in full. Both stay reachable through
+the full catalogue and search. The shelf grid renders covers through
+`/api/proxy` rather than hotlinking the CDN, so a blocked or dead cover degrades
+to the placeholder icon instead of a broken image. Spectre Scans' sitemap lists
+a few covers whose filenames contain a colon; the CDN does not serve those, so
+they are dropped at listing time.
 
 Pass `?all=1` for the full catalogue (~1200 titles), which pages server-side via
 `offset` (60 per page) and filters by `source` and `q` on the server. The UI's

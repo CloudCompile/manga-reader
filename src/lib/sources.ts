@@ -339,10 +339,18 @@ function chapterLinks(
 ): ChapterItem[] {
   const seg = pathSegment === "any" ? "(?:manga|comic)" : pathSegment;
   const slugPart = slug ? escapeReg(slug) : "[^/]+?";
-  const re = new RegExp(
-    `href=["'](https?://(?:[a-z0-9-]+\\.)*${host}/${seg}/${slugPart}-chapter-([0-9]+(?:[.-][0-9]+)?)/?)["']`,
-    "gi"
+  return collectChapterLinks(
+    html,
+    new RegExp(
+      `href=["'](https?://(?:[a-z0-9-]+\\.)*${host}/${seg}/${slugPart}-chapter-([0-9]+(?:[.-][0-9]+)?)/?)["']`,
+      "gi"
+    )
   );
+}
+
+// Collect chapter links from a pattern whose group 1 is the URL and group 2 the
+// chapter slug. Deduplicated and labelled; ordering is left to the caller.
+function collectChapterLinks(html: string, re: RegExp): ChapterItem[] {
   const map = new Map<string, ChapterItem>();
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
@@ -442,23 +450,138 @@ const GENERIC_NUM = (url: string): string => {
   return m ? m[1].replace(/-/g, ".") : "";
 };
 
-// mangafragrant.com — the original source.
+// mangafragrant.com — the original source. Its chapter pages below #183 are
+// still correct, but from #183 up the site serves the wrong series (the page
+// points at its "return of" upload folder) and #195 has no images at all, so
+// ffb (below) takes over the series entirely. This source is kept only for its
+// back catalogue (<= #182), which carries side chapters (.5) that ffb lacks;
+// the listing is capped and the parser rejects the wrong-series folder so the
+// catalogue can never open the broken copy.
+const MANGAFRAGRANT_LAST_GOOD = 182;
 const mangafragrant: Source = {
   id: "mangafragrant",
   name: "MangaFragrant",
   hosts: [/mangafragrant(flower)?\.com$/i],
   browseFromListing: true,
   seriesKey: GENERIC_SLUG,
-  listingUrls: () => ["https://www.mangafragrant.com/manga/"],
+  // The homepage carries the full chapter list; /manga/ only lists the newest
+  // ten, which are all in the broken (>= #183) range the cap below drops.
+  listingUrls: () => ["https://www.mangafragrant.com/"],
   parseChapter(html, url) {
     const { title, h1 } = pageTitle(html);
     const parsed = parseChapterTitle(h1 || title);
     const images = pickImages(html, { hosts: ["contabostorage.com"], altRe: /image\s*\d+/i, base: url });
+    // #183 and up are the wrong series: the page either points at the "return
+    // of" upload folder (percent-encoded in the src) or, for #195, has no
+    // images at all. Refuse both rather than showing the reader another manga.
+    const num = numFromSlug(GENERIC_NUM(url));
+    const wrongSeries = images.some((src) => /return(%20| )of\//i.test(decodeURIComponent(src)));
+    if (num > MANGAFRAGRANT_LAST_GOOD || wrongSeries) {
+      throw new Error(
+        "MangaFragrant serves the wrong series from chapter 183. Use The Fragrant Flower Blooms with Dignity instead."
+      );
+    }
     const nav = relNav(html);
     // rel=prev is the lower chapter, rel=next the higher one.
+    let nextUrl = nav.next;
+    // The site's own "next" past #182 is unreliable (from #182 it jumps to the
+    // broken #195), so hand the reader to the immediate next chapter on ffb
+    // instead of dropping them into another series.
+    if (nextUrl && numFromSlug(GENERIC_NUM(nextUrl)) > MANGAFRAGRANT_LAST_GOOD) {
+      nextUrl = ffbChapterUrl(num + 1);
+    }
     return {
       title,
       mangaName: parsed.mangaName,
+      chapterNum: GENERIC_NUM(url) || parsed.chapterNum,
+      images,
+      prevUrl: nav.prev,
+      nextUrl,
+    };
+  },
+  parseList(html) {
+    return chapterLinks(html, null, "mangafragrantflower?\\.com", "manga").filter(
+      (c) => c.num <= MANGAFRAGRANT_LAST_GOOD
+    );
+  },
+  search: undefined,
+};
+
+// thefragrantflowerbloomswithdignity.com — The Fragrant Flower Blooms with
+// Dignity. Replaces mangafragrant for this series: that site points its recent
+// chapters (>= #183) at an unrelated upload folder, so the reader used to show
+// a different manga. This one has all 204 chapters, numbered and .5 extras, on
+// one host with no hotlink protection.
+//
+// Unlike the other single-series sources its chapter URLs do not live under
+// /manga/ or /comic/, so the generic slug/number helpers and chapterLinks do
+// not apply; the listing and chapter patterns are built explicitly below.
+const FFB_ORIGIN = "https://thefragrantflowerbloomswithdignity.com";
+const FFB_SLUG = "the-fragrant-flower-blooms-with-dignity-manga";
+const FFB_PAGES = "/wp-content/uploads/manga/the-fragrant-flower-blooms-with-dignity-manga/";
+// Chapters are numbered 1..204 with a few .5 extras, written as "chapter-29-5".
+const FFB_CHAPTER_RE = /chapter-([0-9]+(?:-[0-9]+)?)\/?$/i;
+
+// Canonical URL for a chapter on ffb. Used both by the source and to redirect
+// MangaFragrant's broken #183+ "next" link to the same chapter here.
+function ffbChapterUrl(num: number): string {
+  return `${FFB_ORIGIN}/${FFB_SLUG}-chapter-${String(num).replace(".", "-")}/`;
+}
+
+// The chapter list comes from the WordPress REST API rather than the homepage.
+// The homepage omits #199 (it is published but not linked), which would leave a
+// hole in the list, so the API is the only complete source. It is a stock
+// WordPress install, so this needs no scraping.
+async function ffbFetchList(): Promise<{ chapters: ChapterItem[]; mangaName: string }> {
+  const chapters: ChapterItem[] = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= 5; page++) {
+    const raw = await fetchText(
+      `${FFB_ORIGIN}/wp-json/wp/v2/posts?per_page=100&page=${page}&_fields=link`,
+      { referer: `${FFB_ORIGIN}/` }
+    );
+    let posts: { link?: string }[];
+    try {
+      posts = JSON.parse(raw);
+    } catch {
+      break;
+    }
+    if (!Array.isArray(posts) || !posts.length) break;
+    for (const post of posts) {
+      const link = (post.link || "").replace(/\/$/, "") + "/";
+      const m = link.match(FFB_CHAPTER_RE);
+      if (!m || !link.includes(FFB_SLUG)) continue;
+      if (seen.has(link)) continue;
+      seen.add(link);
+      const num = numFromSlug(m[1]);
+      chapters.push({ num, url: link, title: chapterLabel(num, String(num)) });
+    }
+    if (posts.length < 100) break;
+  }
+  return { chapters, mangaName: "The Fragrant Flower Blooms with Dignity" };
+}
+
+const ffb: Source = {
+  id: "ffb",
+  name: "The Fragrant Flower Blooms with Dignity",
+  hosts: [/^thefragrantflowerbloomswithdignity\.com$/i, /^www\.thefragrantflowerbloomswithdignity\.com$/i],
+  seriesKey: () => "the-fragrant-flower-blooms-with-dignity",
+  browseFromListing: true,
+  listingUrls: () => [`${FFB_ORIGIN}/`],
+  fetchList: ffbFetchList,
+  parseChapter(html, url) {
+    const { title, h1 } = pageTitle(html);
+    // The page title is "<Name> Manga Chapter 196 - <site name>"; the chapter
+    // heading is the same minus the trailing site name.
+    const parsed = parseChapterTitle(h1 || title);
+    const images = pickImages(html, { hosts: ["thefragrantflowerbloomswithdignity.com"], base: url })
+      // The logo and the author avatar are served from the same host as the
+      // pages, so they have to be excluded by path.
+      .filter((u) => u.includes(FFB_PAGES) && /\/[0-9]+\.(?:jpe?g|png|webp|gif|avif)$/i.test(u));
+    const nav = relNav(html);
+    return {
+      title,
+      mangaName: parsed.mangaName.replace(/\s+manga$/i, "").trim(),
       chapterNum: GENERIC_NUM(url) || parsed.chapterNum,
       images,
       prevUrl: nav.prev,
@@ -466,7 +589,14 @@ const mangafragrant: Source = {
     };
   },
   parseList(html) {
-    return chapterLinks(html, null, "mangafragrantflower?\\.com", "manga").map((c) => c);
+    // Only used when the API is unreachable; the homepage misses #199.
+    return collectChapterLinks(
+      html,
+      new RegExp(
+        `href=["'](https?://(?:www\\.)?thefragrantflowerbloomswithdignity\\.com/${FFB_SLUG}-chapter-([0-9]+(?:-[0-9]+)?)/?)["']`,
+        "gi"
+      )
+    );
   },
   search: undefined,
 };
@@ -1029,6 +1159,7 @@ function collectAllMangaImages(edge: {
 
 export const SOURCES: Source[] = [
   mangafragrant,
+  ffb,
   komic,
   bluebox,
   dandadana,
@@ -1227,11 +1358,16 @@ const TITLE_CACHE = new Map<string, { data: TitleItem[]; ts: number }>();
 
 // Group a listing page's chapter links into the distinct series it mentions.
 async function titlesFromListing(source: Source): Promise<TitleItem[]> {
-  if (!source.parseList || !source.listingUrls) return [];
+  if (!source.listingUrls) return [];
   for (const lu of source.listingUrls("")) {
     try {
-      const html = await fetchText(lu, { referer: originOf(lu) });
-      const items = source.parseList(html, lu);
+      // Prefer the source's own list fetch: for ffb the homepage omits a
+      // published chapter, so parseList alone undercounts.
+      const items = source.fetchList
+        ? (await source.fetchList(lu)).chapters
+        : source.parseList
+          ? source.parseList(await fetchText(lu, { referer: originOf(lu) }), lu)
+          : [];
       if (!items.length) continue;
       const bySeries = new Map<string, { best: ChapterItem; count: number }>();
       for (const item of items) {
@@ -1330,7 +1466,12 @@ export async function listTitles(): Promise<TitleItem[]> {
 // AllManga is deliberately excluded. Its listing is a recency feed rather than
 // a catalogue, so its 60 slots would churn every session and crowd out the
 // curated picks. It remains reachable through the full catalogue and search.
-const SHELF_EXCLUDED_SOURCES = new Set(["allmanga"]);
+//
+// MangaFragrant is excluded for the same reason in reverse: its recent chapters
+// belong to another series, so the shelf would offer a broken copy of a title
+// that ffb already carries in full. It stays in the catalogue for its back
+// catalogue (<= #182).
+const SHELF_EXCLUDED_SOURCES = new Set(["allmanga", "mangafragrant"]);
 
 export async function listCuratedTitles(): Promise<TitleItem[]> {
   const { titles } = await listCuratedTitlesWithHealth();
