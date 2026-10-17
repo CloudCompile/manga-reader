@@ -20,6 +20,11 @@ import {
   Menu,
   Layers,
   Library,
+  Home,
+  Maximize2,
+  Minimize2,
+  Keyboard,
+  Columns2,
 } from "lucide-react";
 import {
   getHistory,
@@ -28,6 +33,11 @@ import {
   setLastRead,
   getTheme,
   setTheme as persistTheme,
+  getFitMode,
+  setFitMode as persistFitMode,
+  getWide,
+  setWide as persistWide,
+  setPage,
   type HistoryEntry,
 } from "@/lib/storage";
 
@@ -104,9 +114,20 @@ export default function MangaReader() {
   const [pageInput, setPageInput] = useState("");
   const [showPageJumper, setShowPageJumper] = useState(false);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
+  const [wide, setWide] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [chromeHidden, setChromeHidden] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const imgRefs = useRef<Map<number, HTMLImageElement>>(new Map());
+  // Mirrors of state read inside the scroll handler, which is attached once.
+  const dataRef = useRef<ChapterData | null>(null);
+  const currentUrlRef = useRef<string>("");
+  const resumeRef = useRef<{ url: string; page: number } | null>(null);
+  const lastPageSaved = useRef(0);
+  const lastScrollY = useRef(0);
+  const scrollEnd = useRef<number | null>(null);
 
   // Init
   useEffect(() => {
@@ -114,6 +135,8 @@ export default function MangaReader() {
     const saved = getLastRead();
     if (saved) setUrl(saved);
     setTheme(getTheme());
+    setFitMode(getFitMode());
+    setWide(getWide());
   }, []);
 
   // Title listing for the browse grid
@@ -138,13 +161,20 @@ export default function MangaReader() {
     };
   }, []);
 
-  // Scroll listener
+  // Scroll listener: track the visible page, hide the chrome while reading
+  // downwards, and remember the furthest page reached in this chapter.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
-      setShowScrollTop(el.scrollTop > 600);
-      // Track which page we're viewing
+      const y = el.scrollTop;
+      setShowScrollTop(y > 600);
+
+      // Hide the top/bottom bars when scrolling down, reveal on any upward move.
+      const delta = y - lastScrollY.current;
+      lastScrollY.current = y;
+      if (Math.abs(delta) > 6) setChromeHidden(delta > 0 && y > 120);
+
       const imgs = el.querySelectorAll("img");
       for (let i = 0; i < imgs.length; i++) {
         const rect = imgs[i].getBoundingClientRect();
@@ -153,9 +183,29 @@ export default function MangaReader() {
           break;
         }
       }
+
+      // Persist progress once scrolling settles, so we do not write on every tick.
+      if (scrollEnd.current) window.clearTimeout(scrollEnd.current);
+      scrollEnd.current = window.setTimeout(() => {
+        const imgs2 = el.querySelectorAll("img");
+        let page = 0;
+        for (let i = 0; i < imgs2.length; i++) {
+          const rect = imgs2[i].getBoundingClientRect();
+          if (rect.top >= -rect.height / 2) { page = i + 1; break; }
+        }
+        const current = dataRef.current;
+        if (current && page > 0 && page > lastPageSaved.current && currentUrlRef.current) {
+          lastPageSaved.current = page;
+          setPage(currentUrlRef.current, page);
+          setHistory(getHistory());
+        }
+      }, 400);
     };
     el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (scrollEnd.current) window.clearTimeout(scrollEnd.current);
+    };
   }, [data]);
 
   // Set initial page to 1 when data loads
@@ -175,12 +225,19 @@ export default function MangaReader() {
         toggleTheme();
       } else if (e.key === "l" || e.key === "L") {
         setShowChapters((v) => !v);
+      } else if (e.key === "w" || e.key === "W") {
+        toggleWide();
+      } else if (e.key === "f" || e.key === "F") {
+        toggleFullscreen();
+      } else if (e.key === "?") {
+        setShowShortcuts((v) => !v);
       } else if (e.key === "Escape") {
         setShowChapters(false);
         setShowSearch(false);
         setShowHistory(false);
         setShowPageJumper(false);
         setShowMobileMenu(false);
+        setShowShortcuts(false);
       } else if (e.key === "g" || e.key === "G") {
         setShowPageJumper((v) => !v);
       }
@@ -201,11 +258,17 @@ export default function MangaReader() {
     setLoadedImages(new Set());
     setCurrentPage(0);
     setShowScrollTop(false);
+    setChromeHidden(false);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     setUrl(chapterUrl);
     setLastRead(chapterUrl);
     setShowChapters(false);
     setShowMobileMenu(false);
+    currentUrlRef.current = chapterUrl;
+    lastPageSaved.current = 0;
+    // Restore the page this chapter was left on, if it was read before.
+    const prior = getHistory().find((h) => h.url === chapterUrl);
+    resumeRef.current = prior?.page && prior.page > 1 ? { url: chapterUrl, page: prior.page } : null;
 
     try {
       const res = await fetch("/api/scrape", {
@@ -215,6 +278,7 @@ export default function MangaReader() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Failed to load chapter");
+      dataRef.current = json;
       setData(json);
       setHistory(
         pushHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() })
@@ -297,11 +361,64 @@ export default function MangaReader() {
 
   const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); loadChapter(url); };
   const goToChapter = (chapterUrl: string | null) => { if (chapterUrl) loadChapter(chapterUrl); };
+  const goHome = () => {
+    setData(null);
+    dataRef.current = null;
+    setError("");
+    setChapters([]);
+    setVolumes([]);
+    setLoadedImages(new Set());
+    setShowMobileMenu(false);
+    setShowChapters(false);
+    setShowShortcuts(false);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  };
   const scrollToTop = () => scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   const toggleTheme = () => {
     const next = theme === "dark" ? "light" : "dark";
     setTheme(next);
     persistTheme(next);
+  };
+  const chooseFitMode = (mode: FitMode) => { setFitMode(mode); persistFitMode(mode); };
+  const toggleWide = () => { const next = !wide; setWide(next); persistWide(next); };
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else document.documentElement.requestFullscreen().catch(() => {});
+  };
+
+  // Restore the saved page once the images have been laid out.
+  useEffect(() => {
+    const pending = resumeRef.current;
+    if (!data || !pending || pending.url !== currentUrlRef.current) return;
+    if (!data.images.length) return;
+    let cancelled = false;
+    let tries = 0;
+    const attempt = () => {
+      if (cancelled) return;
+      const img = imgRefs.current.get(pending.page - 1);
+      if (img && img.getBoundingClientRect().height > 0) {
+        img.scrollIntoView({ block: "start" });
+        lastPageSaved.current = pending.page;
+        resumeRef.current = null;
+        return;
+      }
+      if (tries++ < 20) window.setTimeout(attempt, 120);
+    };
+    attempt();
+    return () => { cancelled = true; };
+  }, [data]);
+
+  // Track fullscreen changes so the toggle icon stays in sync.
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  // Turn a page by clicking the image area, unless a control is the target.
+  const onImageClick = () => {
+    if (data?.nextUrl) goToChapter(data.nextUrl);
+    else scrollRef.current?.scrollBy({ top: scrollRef.current.clientHeight * 0.9, behavior: "smooth" });
   };
 
   const jumpToPage = (page: number) => {
@@ -363,6 +480,22 @@ export default function MangaReader() {
     : fitMode === "height" ? { height: "100vh", width: "auto", margin: "0 auto" }
     : { maxWidth: "100%", height: "auto", margin: "0 auto" };
 
+  // Wide mode pairs consecutive pages; "width" is the only sensible fit there,
+  // so a 50% cap keeps a two-page spread inside the viewport.
+  const wideStyle: React.CSSProperties = wide ? { ...imgStyle, width: "100%" } : imgStyle;
+
+  // Pages grouped for rendering: pairs in wide mode, singles otherwise.
+  const pageGroups: number[][] = [];
+  if (data) {
+    if (wide) {
+      for (let i = 0; i < data.images.length; i += 2) {
+        pageGroups.push(i + 1 < data.images.length ? [i, i + 1] : [i]);
+      }
+    } else {
+      for (let i = 0; i < data.images.length; i++) pageGroups.push([i]);
+    }
+  }
+
   // ─── Sidebar panel component ─────────────────────
   const SidePanel = ({ title, icon, show, onClose, children }: {
     title: string; icon: React.ReactNode; show: boolean; onClose: () => void; children: React.ReactNode;
@@ -388,68 +521,92 @@ export default function MangaReader() {
   // ─── Loading ────────────────────────────────────────
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-4 p-6 bg-[#0a0a0a]">
-        <Loader2 className="h-10 w-10 animate-spin text-white/60" />
-        <p className="text-white/60 text-sm">Loading chapter…</p>
+      <div className={`min-h-screen flex flex-col items-center justify-center gap-4 p-6 ${bg}`}>
+        <Loader2 className={`h-10 w-10 animate-spin ${isDark ? "text-white/60" : "text-gray-400"}`} />
+        <p className={`text-sm ${subText}`}>Loading chapter…</p>
       </div>
     );
   }
 
   // ─── Landing ────────────────────────────────────────
   if (!data && !error) {
+    const continueEntry = history.find((h) => h.page && h.page > 1) || history[0];
     return (
-      <div className="min-h-screen flex flex-col bg-[#0a0a0a]">
+      <div className={`min-h-screen flex flex-col ${bg} ${textCol}`}>
         {/* Header */}
         <header className={`border-b px-6 py-4 flex items-center justify-between ${isDark ? "border-white/10" : "border-gray-200"} ${panelBg}`}>
           <div className="flex items-center gap-3">
-            <BookOpen className="h-6 w-6 text-white" />
-            <h1 className="text-xl font-bold text-white">Manga Reader</h1>
+            <BookOpen className={`h-6 w-6 ${isDark ? "text-white" : "text-gray-900"}`} />
+            <h1 className={`text-xl font-bold ${isDark ? "text-white" : "text-gray-900"}`}>Manga Reader</h1>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={() => setShowSearch(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="Search manga"><Search className="h-5 w-5" /></button>
-            <button onClick={() => setShowHistory(true)} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`} title="History"><History className="h-5 w-5" /></button>
-            <button onClick={toggleTheme} className={`p-2 rounded ${isDark ? "text-white/60 hover:bg-white/10" : "text-gray-500 hover:bg-gray-100"}`}><Sun className="h-5 w-5" /></button>
+            <button onClick={() => setShowSearch(true)} className={`p-2 rounded ${subText} ${hoverBg}`} title="Search manga"><Search className="h-5 w-5" /></button>
+            <button onClick={() => setShowHistory(true)} className={`p-2 rounded ${subText} ${hoverBg}`} title="History"><History className="h-5 w-5" /></button>
+            <button onClick={toggleTheme} className={`p-2 rounded ${subText} ${hoverBg}`} title="Toggle theme">
+              {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+            </button>
           </div>
         </header>
 
         {/* Main */}
         <main className="flex-1 flex flex-col items-center gap-8 p-6">
-          <div className="text-center max-w-lg pt-6">
-            <h2 className="text-2xl font-bold text-white mb-2">Read manga, ad-free</h2>
-            <p className="text-white/50 text-sm">Pick a title below, paste a chapter URL from a supported site, or search for a manga.</p>
-          </div>
-
-          <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
-            <Input type="url" placeholder="https://example.com/manga/title-chapter-1/" value={url} onChange={(e) => setUrl(e.target.value)}
-              className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
-            <Button type="submit">Read</Button>
-          </form>
-
-          {/* Recent History */}
-          {history.length > 0 && (
-            <div className="w-full max-w-lg">
-              <h3 className={`text-xs font-semibold uppercase tracking-wider mb-3 ${subText}`}>Recent</h3>
-              <div className="space-y-1">
-                {history.slice(0, 5).map((h) => (
-                  <button key={h.url} onClick={() => loadChapter(h.url)}
-                    className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${isDark ? "hover:bg-white/5 text-white/70" : "hover:bg-gray-100 text-gray-600"}`}>
-                    <span className="font-medium">{h.mangaName}</span>
-                    {h.chapterNum && <span className={subText}> · Ch {h.chapterNum}</span>}
-                  </button>
-                ))}
-              </div>
+          {/* Hero */}
+          <section className="w-full max-w-3xl text-center pt-10 pb-2">
+            <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] mb-5 ${isDark ? "bg-white/5 text-white/60" : "bg-gray-100 text-gray-500"}`}>
+              <Library className="h-3 w-3" /> {titles.length} titles · {sourceOptions.length} sources
             </div>
-          )}
+            <h2 className={`text-3xl sm:text-4xl font-bold tracking-tight mb-3 ${isDark ? "text-white" : "text-gray-900"}`}>
+              Read manga, ad-free
+            </h2>
+            <p className={`text-sm mb-8 ${subText}`}>
+              Search the catalogue, pick a title from the shelf, or paste a chapter URL.
+            </p>
+
+            {/* Live search */}
+            <div className="relative max-w-xl mx-auto">
+              <Search className={`absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 ${subText}`} />
+              <Input placeholder="Search titles across every source…" value={titleQuery}
+                onChange={(e) => setTitleQuery(e.target.value)}
+                className={`pl-9 h-11 text-base ${isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-white border-gray-200 text-gray-900 placeholder:text-gray-400"}`} />
+              {titleQuery && (
+                <button onClick={() => setTitleQuery("")} className={`absolute right-3 top-1/2 -translate-y-1/2 p-0.5 rounded ${subText} ${hoverBg}`}>
+                  <X className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+
+            {/* Continue reading */}
+            {continueEntry && !titleQuery && (
+              <button onClick={() => loadChapter(continueEntry.url)}
+                className={`mt-6 inline-flex items-center gap-3 px-4 py-3 rounded-xl border text-left transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
+                <BookOpen className={`h-5 w-5 shrink-0 ${isDark ? "text-white/70" : "text-gray-500"}`} />
+                <span>
+                  <span className={`block text-xs uppercase tracking-wider ${subText}`}>Continue reading</span>
+                  <span className="block text-sm font-medium">
+                    {continueEntry.mangaName}
+                    {continueEntry.chapterNum && <span className={subText}> · Ch {continueEntry.chapterNum}</span>}
+                    {continueEntry.page ? <span className={subText}> · p{continueEntry.page}</span> : null}
+                  </span>
+                </span>
+                <ChevronRight className={`h-4 w-4 shrink-0 ${subText}`} />
+              </button>
+            )}
+
+            {/* URL paste */}
+            <form onSubmit={handleSubmit} className="mt-6 max-w-xl mx-auto flex gap-2">
+              <Input type="url" placeholder="…or paste a chapter URL" value={url} onChange={(e) => setUrl(e.target.value)}
+                className={isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-white border-gray-200 text-gray-900 placeholder:text-gray-400"} />
+              <Button type="submit" variant={isDark ? "default" : "outline"}>Read</Button>
+            </form>
+          </section>
 
           {/* Browse titles */}
           <div className="w-full max-w-5xl pb-6 mx-auto">
             <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
               <h3 className={`text-xs font-semibold uppercase tracking-wider flex items-center gap-2 ${subText}`}>
-                <Library className="h-4 w-4" /> Shelf {titles.length ? `(${titles.length})` : ""}
+                <Library className="h-4 w-4" /> Shelf {visibleTitles.length ? `(${visibleTitles.length})` : ""}
               </h3>
-              <div className="flex items-center gap-2 flex-1 justify-end min-w-[240px]">
-                <Input placeholder="Filter by name…" value={titleQuery} onChange={(e) => setTitleQuery(e.target.value)}
-                  className="max-w-[220px] bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+              <div className="flex items-center gap-2 flex-1 justify-end min-w-[180px]">
                 <select value={titleSource} onChange={(e) => setTitleSource(e.target.value)}
                   className={`text-sm rounded-md border px-2 py-1.5 ${isDark ? "bg-white/5 border-white/10 text-white/80" : "bg-white border-gray-200 text-gray-700"}`}>
                   <option value="all">All sources</option>
@@ -461,9 +618,9 @@ export default function MangaReader() {
             </div>
 
             {titlesLoading && (
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
                 {Array.from({ length: 10 }).map((_, i) => (
-                  <div key={i} className="rounded-lg overflow-hidden">
+                  <div key={i} className="rounded-xl overflow-hidden">
                     <Skeleton className="w-full" style={{ aspectRatio: "2/3" }} />
                   </div>
                 ))}
@@ -478,23 +635,26 @@ export default function MangaReader() {
               <p className={`text-sm ${subText}`}>No titles match this filter.</p>
             )}
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
               {!titlesLoading && visibleTitles.map((t) => (
                 <button key={`${t.sourceId}:${t.url}`} onClick={() => openTitle(t)}
-                  className={`group text-left rounded-lg overflow-hidden border transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
+                  className={`group text-left rounded-xl overflow-hidden border transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
                   <div className={`relative w-full overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
                     {t.thumbnail ? (
-                      <img src={PROXY(t.thumbnail)} alt="" loading="lazy" className="w-full h-full object-cover" />
+                      <img src={PROXY(t.thumbnail)} alt="" loading="lazy"
+                        className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]" />
                     ) : (
                       <div className={`w-full h-full flex items-center justify-center ${subText}`}>
                         <BookOpen className="h-8 w-8" />
                       </div>
                     )}
                   </div>
-                  <div className="p-2">
+                  <div className="p-2.5">
                     <div className={`text-xs font-medium leading-snug line-clamp-2 ${isDark ? "text-white/90" : "text-gray-800"}`}>{t.title}</div>
-                    <div className={`text-[10px] mt-1 ${subText}`}>
-                      {t.sourceName}{t.latestChapter ? ` · ${t.latestChapter}` : ""}
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded-full truncate max-w-full ${isDark ? "bg-white/10 text-white/50" : "bg-gray-100 text-gray-500"}`}>
+                        {t.sourceName}
+                      </span>
                     </div>
                   </div>
                 </button>
@@ -504,7 +664,7 @@ export default function MangaReader() {
 
           {/* Keyboard shortcuts hint */}
           <div className={`text-xs ${subText} text-center space-y-1 pb-6`}>
-            <p>Keyboard shortcuts: <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">←</kbd> <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">→</kbd> chapters · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">T</kbd> theme · <kbd className="px-1 py-0.5 rounded bg-white/10 text-[10px]">L</kbd> chapter list</p>
+            <p>Keyboard shortcuts: <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>←</kbd> <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>→</kbd> chapters · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>T</kbd> theme · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>L</kbd> chapter list · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>?</kbd> all</p>
           </div>
         </main>
 
@@ -514,16 +674,16 @@ export default function MangaReader() {
             <div className="flex gap-2">
               <Input placeholder="Search…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-                className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+                className={isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-gray-50 border-gray-200 text-gray-900"} />
               <Button size="sm" onClick={handleSearch} disabled={searchLoading}>Go</Button>
             </div>
             {searchLoading && <div className="flex justify-center py-4"><Loader2 className="h-5 w-5 animate-spin" /></div>}
             <div className="space-y-1">
               {searchResults.map((r, i) => (
                 <button key={i} onClick={() => { loadChapter(r.url); setShowSearch(false); }}
-                  className="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-white/5 text-white/80">
+                  className={`w-full text-left px-3 py-2 rounded-lg text-sm ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
                   <div className="font-medium">{r.title}</div>
-                  <div className="text-xs text-white/40">{[r.latestChapter, r.source].filter(Boolean).join(" · ")}</div>
+                  <div className={`text-xs ${subText}`}>{[r.latestChapter, r.source].filter(Boolean).join(" · ")}</div>
                 </button>
               ))}
             </div>
@@ -532,12 +692,14 @@ export default function MangaReader() {
 
         <SidePanel title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
           <div className="p-4 space-y-1">
-            {history.length === 0 && <p className="text-white/40 text-sm">No history yet</p>}
+            {history.length === 0 && <p className={`text-sm ${subText}`}>No history yet</p>}
             {history.map((h) => (
               <button key={h.url} onClick={() => { loadChapter(h.url); setShowHistory(false); }}
-                className="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-white/5 text-white/80">
+                className={`w-full text-left px-3 py-2 rounded-lg text-sm ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
                 <div className="font-medium">{h.mangaName}</div>
-                <div className="text-xs text-white/40">Ch {h.chapterNum} · {new Date(h.timestamp).toLocaleDateString()}</div>
+                <div className={`text-xs ${subText}`}>
+                  Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""} · {new Date(h.timestamp).toLocaleDateString()}
+                </div>
               </button>
             ))}
           </div>
@@ -549,11 +711,15 @@ export default function MangaReader() {
   // ─── Error ──────────────────────────────────────────
   if (error) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-6 p-6 bg-[#0a0a0a]">
+      <div className={`min-h-screen flex flex-col items-center justify-center gap-6 p-6 ${bg} ${textCol}`}>
         <p className="text-red-400 text-sm max-w-md text-center">{error}</p>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={goHome}><Home className="h-4 w-4 mr-1" /> Library</Button>
+          <Button variant="outline" onClick={() => { setError(""); }}>Dismiss</Button>
+        </div>
         <form onSubmit={handleSubmit} className="w-full max-w-lg flex gap-2">
           <Input type="url" placeholder="Try a different URL…" value={url} onChange={(e) => setUrl(e.target.value)}
-            className="bg-white/5 border-white/10 text-white placeholder:text-white/30" />
+            className={isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-white border-gray-200 text-gray-900"} />
           <Button type="submit">Retry</Button>
         </form>
         {data?.prevUrl && <Button variant="outline" onClick={() => goToChapter(data.prevUrl)}><ChevronLeft className="h-4 w-4 mr-1" /> Previous Chapter</Button>}
@@ -567,10 +733,10 @@ export default function MangaReader() {
   return (
     <div className={`h-screen flex flex-col ${bg} ${textCol} overflow-hidden`}>
       {/* Top bar */}
-      <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg} z-40`}>
+      <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg} z-40 transition-transform duration-300 ${chromeHidden ? "-translate-y-full" : ""}`}>
         <button onClick={() => setShowMobileMenu((v) => !v)} className={`p-1.5 rounded sm:hidden ${hoverBg}`}><Menu className="h-5 w-5" /></button>
+        <button onClick={goHome} className={`p-1.5 rounded ${hoverBg}`} title="Back to library"><Home className="h-4 w-4" /></button>
         <div className="flex items-center gap-2 min-w-0 flex-1">
-          <BookOpen className="h-4 w-4 shrink-0" />
           <h1 className="text-sm font-semibold truncate">{data.mangaName}</h1>
           {data.chapterNum && <span className={subText}>· Ch {data.chapterNum}</span>}
           {data.sourceName && <span className={`hidden sm:inline text-[10px] px-1.5 py-0.5 rounded ${isDark ? "bg-white/10 text-white/50" : "bg-gray-100 text-gray-500"}`}>{data.sourceName}</span>}
@@ -578,32 +744,46 @@ export default function MangaReader() {
 
         {/* Desktop buttons */}
         <div className="hidden sm:flex items-center gap-1">
-          <button onClick={() => setShowChapters((v) => !v)} className={`px-2 py-1 rounded text-xs transition-colors ${showChapters ? "bg-white/15" : ""} ${subText} ${hoverBg}`} title="Chapter list (L)"><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
-          <div className="w-px h-4 bg-white/10 mx-1" />
+          <button onClick={() => setShowChapters((v) => !v)} className={`px-2 py-1 rounded text-xs transition-colors ${showChapters ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Chapter list (L)"><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
+          <div className={`w-px h-4 mx-1 ${isDark ? "bg-white/10" : "bg-gray-200"}`} />
           {(["width", "height", "original"] as const).map((fm) => (
-            <button key={fm} onClick={() => setFitMode(fm)}
-              className={`px-2 py-1 rounded text-xs transition-colors ${fitMode === fm ? "bg-white/15" : ""} ${subText} ${hoverBg}`}>
+            <button key={fm} onClick={() => chooseFitMode(fm)}
+              className={`px-2 py-1 rounded text-xs transition-colors ${fitMode === fm ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`}>
               {fm === "width" ? "Fit W" : fm === "height" ? "Fit H" : "1:1"}
             </button>
           ))}
-          <div className="w-px h-4 bg-white/10 mx-1" />
+          <button onClick={toggleWide} className={`p-1.5 rounded ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Two-page spread (W)"><Columns2 className="h-4 w-4" /></button>
+          <button onClick={toggleFullscreen} className={`p-1.5 rounded ${subText} ${hoverBg}`} title="Fullscreen (F)">
+            {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </button>
+          <div className={`w-px h-4 mx-1 ${isDark ? "bg-white/10" : "bg-gray-200"}`} />
           <button onClick={() => setShowPageJumper((v) => !v)} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`} title="Jump to page (G)">
             {currentPage}/{totalPages}
           </button>
-          <button onClick={toggleTheme} className={`p-1.5 rounded ${hoverBg} ${subText}`}><Sun className="h-4 w-4" /></button>
+          <button onClick={() => setShowShortcuts(true)} className={`p-1.5 rounded ${subText} ${hoverBg}`} title="Keyboard shortcuts (?)"><Keyboard className="h-4 w-4" /></button>
+          <button onClick={toggleTheme} className={`p-1.5 rounded ${subText} ${hoverBg}`} title="Toggle theme (T)">
+            {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </button>
         </div>
       </header>
 
       {/* Mobile dropdown menu */}
       {showMobileMenu && (
         <div className={`sm:hidden border-b px-3 py-3 flex flex-wrap gap-2 ${barBg} z-30`}>
+          <button onClick={() => { goHome(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}><Home className="h-3.5 w-3.5 inline mr-1" />Library</button>
           <button onClick={() => { setShowChapters((v) => !v); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
           {(["width", "height", "original"] as const).map((fm) => (
-            <button key={fm} onClick={() => { setFitMode(fm); setShowMobileMenu(false); }}
-              className={`px-3 py-1.5 rounded text-xs ${fitMode === fm ? "bg-white/15" : ""} ${hoverBg}`}>
+            <button key={fm} onClick={() => { chooseFitMode(fm); setShowMobileMenu(false); }}
+              className={`px-3 py-1.5 rounded text-xs ${fitMode === fm ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
               {fm === "width" ? "Fit Width" : fm === "height" ? "Fit Height" : "Original"}
             </button>
           ))}
+          <button onClick={() => { toggleWide(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
+            <Columns2 className="h-3.5 w-3.5 inline mr-1" />Two-page
+          </button>
+          <button onClick={() => { toggleFullscreen(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
+            {isFullscreen ? <Minimize2 className="h-3.5 w-3.5 inline mr-1" /> : <Maximize2 className="h-3.5 w-3.5 inline mr-1" />}Fullscreen
+          </button>
           <button onClick={() => { setShowPageJumper((v) => !v); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>Page {currentPage}/{totalPages}</button>
           <button onClick={() => { toggleTheme(); setShowMobileMenu(false); }} className={`px-3 py-1.5 rounded text-xs ${hoverBg}`}>
             {isDark ? <Sun className="h-3.5 w-3.5 inline mr-1" /> : <Moon className="h-3.5 w-3.5 inline mr-1" />}Theme
@@ -630,7 +810,7 @@ export default function MangaReader() {
       <SidePanel title={`Chapters (${chapters.length})`} icon={<List className="h-4 w-4" />} show={showChapters} onClose={() => setShowChapters(false)}>
         <div className="p-3">
           {chaptersLoading && <div className="flex justify-center py-8"><Loader2 className="h-5 w-5 animate-spin" /></div>}
-          {chapters.length === 0 && !chaptersLoading && <p className="text-white/40 text-sm text-center py-8">Load a chapter first to see the list</p>}
+          {chapters.length === 0 && !chaptersLoading && <p className={`text-sm text-center py-8 ${subText}`}>Load a chapter first to see the list</p>}
 
           {canGroupByVolume && (
             <div className={`flex items-center gap-1 mb-2 p-0.5 rounded-lg ${isDark ? "bg-white/5" : "bg-gray-100"}`}>
@@ -652,7 +832,7 @@ export default function MangaReader() {
                 return (
                   <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
                     className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
-                      ? "bg-white/15 font-semibold"
+                      ? (isDark ? "bg-white/15" : "bg-gray-200") + " font-semibold"
                       : hoverBg
                     } ${isCurrent ? textCol : subText}`}>
                     {ch.title || `Chapter ${ch.num}`}
@@ -674,7 +854,7 @@ export default function MangaReader() {
                       return (
                         <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
                           className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
-                            ? "bg-white/15 font-semibold"
+                            ? (isDark ? "bg-white/15" : "bg-gray-200") + " font-semibold"
                             : hoverBg
                           } ${isCurrent ? textCol : subText}`}>
                           {ch.title || `Chapter ${ch.num}`}
@@ -696,7 +876,7 @@ export default function MangaReader() {
       </SidePanel>
 
       {/* Image area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto relative">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto relative" onClick={onImageClick}>
         {data.warning && (
           <div className="max-w-2xl mx-auto mt-6 px-4">
             <div className={`rounded-lg border p-4 text-sm ${isDark ? "bg-yellow-900/20 border-yellow-800 text-yellow-300" : "bg-yellow-50 border-yellow-200 text-yellow-700"}`}>
@@ -704,16 +884,22 @@ export default function MangaReader() {
             </div>
           </div>
         )}
-        <div className="flex flex-col items-center">
-          {displayImages.map((src, i) => (
-            <div key={i} className="relative w-full" style={i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : undefined}>
-              {!loadedImages.has(i) && (
-                <Skeleton className="w-full mx-auto" style={{ aspectRatio: "2/3", maxWidth: "800px" }} />
-              )}
-              <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
-                src={src} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
-                style={{ ...imgStyle, display: loadedImages.has(i) ? "block" : "none" }}
-                loading="eager" />
+        <div className={`flex flex-col items-center ${wide ? "mx-auto max-w-[1600px]" : ""}`}>
+          {pageGroups.map((group, gi) => (
+            <div key={gi} className={`w-full flex ${group.length > 1 ? "flex-row justify-center" : "flex-col items-center"}`}>
+              {group.map((i) => (
+                <div key={i} className="relative w-full" style={i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : undefined}>
+                  {!loadedImages.has(i) && (
+                    // A neutral placeholder keeps scroll position stable while
+                    // the real dimensions are unknown; no fixed ratio to guess.
+                    <div className={`w-full mx-auto ${isDark ? "bg-white/[0.04]" : "bg-gray-200/60"} animate-pulse`} style={{ minHeight: "70vh", maxWidth: wide ? "50%" : "800px" }} />
+                  )}
+                  <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
+                    src={displayImages[i]} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
+                    style={{ ...wideStyle, display: loadedImages.has(i) ? "block" : "none" }}
+                    loading={i < 3 ? "eager" : "lazy"} />
+                </div>
+              ))}
             </div>
           ))}
         </div>
@@ -721,25 +907,56 @@ export default function MangaReader() {
       </div>
 
       {/* Bottom nav */}
-      <nav className={`shrink-0 border-t px-4 py-2 flex items-center justify-between ${barBg} z-40`}>
-        <Button variant="ghost" size="sm" disabled={!data.prevUrl} onClick={() => goToChapter(data.prevUrl)}>
+      <nav className={`shrink-0 border-t px-4 py-2 flex items-center justify-between ${barBg} z-40 transition-transform duration-300 ${chromeHidden ? "translate-y-full" : ""}`}>
+        <Button variant="ghost" size="sm" disabled={!data.prevUrl} onClick={(e) => { e.stopPropagation(); goToChapter(data.prevUrl); }}>
           <ChevronLeft className="h-4 w-4 mr-1" /><span className="hidden sm:inline">Prev</span>
         </Button>
 
         <div className="flex items-center gap-2">
-          <button onClick={() => setShowPageJumper(true)} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`}>
+          <button onClick={(e) => { e.stopPropagation(); setShowPageJumper(true); }} className={`px-2 py-1 rounded text-xs ${subText} ${hoverBg}`}>
             {currentPage}/{totalPages}
           </button>
         </div>
 
-        <Button variant="ghost" size="sm" disabled={!data.nextUrl} onClick={() => goToChapter(data.nextUrl)}>
+        <Button variant="ghost" size="sm" disabled={!data.nextUrl} onClick={(e) => { e.stopPropagation(); goToChapter(data.nextUrl); }}>
           <span className="hidden sm:inline">Next</span><ChevronRight className="h-4 w-4 ml-1" />
         </Button>
       </nav>
 
+      {/* Keyboard shortcuts */}
+      {showShortcuts && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setShowShortcuts(false)}>
+          <div className="absolute inset-0 bg-black/60" />
+          <div className={`relative w-full max-w-sm rounded-xl border shadow-2xl p-5 ${panelBg} ${textCol}`} onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="font-semibold text-sm flex items-center gap-2"><Keyboard className="h-4 w-4" /> Keyboard shortcuts</h2>
+              <button onClick={() => setShowShortcuts(false)} className={`p-1 rounded ${hoverBg}`}><X className="h-4 w-4" /></button>
+            </div>
+            <dl className="space-y-2 text-sm">
+              {[
+                ["← / →", "Previous / next chapter"],
+                ["G", "Jump to page"],
+                ["L", "Chapter list"],
+                ["W", "Two-page spread"],
+                ["F", "Fullscreen"],
+                ["T", "Toggle theme"],
+                ["?", "This panel"],
+                ["Esc", "Close panels"],
+              ].map(([key, label]) => (
+                <div key={key} className="flex items-center justify-between gap-4">
+                  <dt className={`text-xs ${subText}`}>{label}</dt>
+                  <dd><kbd className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${isDark ? "bg-white/10" : "bg-gray-200"}`}>{key}</kbd></dd>
+                </div>
+              ))}
+            </dl>
+            <p className={`text-[10px] mt-4 ${subText}`}>Click the page area to advance to the next chapter.</p>
+          </div>
+        </div>
+      )}
+
       {/* Scroll to top */}
       {showScrollTop && (
-        <button onClick={scrollToTop}
+        <button onClick={(e) => { e.stopPropagation(); scrollToTop(); }}
           className={`fixed bottom-20 right-4 p-2.5 rounded-full shadow-lg transition-all z-30 ${isDark ? "bg-white/10 hover:bg-white/20 text-white" : "bg-white hover:bg-gray-100 text-gray-900 border"}`}
           aria-label="Scroll to top"><ArrowUp className="h-5 w-5" /></button>
       )}

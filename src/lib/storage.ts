@@ -11,12 +11,16 @@ export interface HistoryEntry {
   mangaName: string;
   chapterNum: string;
   timestamp: number;
+  // Last page reached in this chapter, so the reader can resume where it left.
+  page?: number;
 }
 
 export interface StoredState {
   history: HistoryEntry[];
   lastRead: string | null;
   theme: "dark" | "light";
+  fitMode: "width" | "height" | "original";
+  wide: boolean;
 }
 
 const COOKIE = "manga_reader_state";
@@ -25,7 +29,7 @@ const MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_COOKIE_LEN = 3800;
 const MAX_HISTORY = 30;
 
-const DEFAULT_STATE: StoredState = { history: [], lastRead: null, theme: "dark" };
+const DEFAULT_STATE: StoredState = { history: [], lastRead: null, theme: "dark", fitMode: "width", wide: false };
 
 let memoryState: StoredState = { ...DEFAULT_STATE };
 let loaded = false;
@@ -72,10 +76,13 @@ function parseState(raw: string | null): StoredState {
           (h): h is HistoryEntry => !!h && typeof h.url === "string" && typeof h.timestamp === "number"
         )
       : [];
+    const fitMode = parsed.fitMode;
     return {
       history,
       lastRead: typeof parsed.lastRead === "string" ? parsed.lastRead : null,
       theme: parsed.theme === "light" ? "light" : "dark",
+      fitMode: fitMode === "height" || fitMode === "original" ? fitMode : "width",
+      wide: parsed.wide === true,
     };
   } catch {
     return { ...DEFAULT_STATE };
@@ -107,8 +114,10 @@ export function getHistory(): HistoryEntry[] {
 
 export function pushHistory(entry: HistoryEntry): HistoryEntry[] {
   const state = loadState();
+  // Re-opening a chapter must not discard the page already reached in it.
+  const existing = state.history.find((e) => e.url === entry.url);
   const history = state.history.filter((e) => e.url !== entry.url);
-  history.unshift({ ...entry, timestamp: Date.now() });
+  history.unshift({ ...entry, page: entry.page ?? existing?.page, timestamp: Date.now() });
   const next = { ...state, history };
   persist(next);
   return next.history;
@@ -130,4 +139,29 @@ export function getTheme(): "dark" | "light" {
 export function setTheme(theme: "dark" | "light"): void {
   const state = loadState();
   persist({ ...state, theme });
+}
+
+export function getFitMode(): "width" | "height" | "original" {
+  return loadState().fitMode;
+}
+
+export function setFitMode(fitMode: "width" | "height" | "original"): void {
+  const state = loadState();
+  persist({ ...state, fitMode });
+}
+
+export function getWide(): boolean {
+  return loadState().wide;
+}
+
+export function setWide(wide: boolean): void {
+  const state = loadState();
+  persist({ ...state, wide });
+}
+
+// Records how far into a chapter the reader got, so it can resume later.
+export function setPage(url: string, page: number): void {
+  const state = loadState();
+  const history = state.history.map((h) => (h.url === url ? { ...h, page } : h));
+  persist({ ...state, history });
 }

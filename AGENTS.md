@@ -63,3 +63,20 @@ through `/api/proxy` rather than hotlinking the CDN, so a blocked or dead
 cover degrades to the placeholder icon instead of a broken image. Spectre
 Scans' sitemap lists a few covers whose filenames contain a colon; the CDN
 does not serve those, so they are dropped at listing time.
+
+## Reader and theming
+
+All reader and shelf state lives in `src/lib/storage.ts`, which writes a single
+`Secure` cookie rather than using `localStorage` (some WebViews stub it out).
+That covers theme, fit mode, two-page mode, history and the last page reached
+in each chapter. Adding persisted state means extending `StoredState` and
+`parseState` together, since a missing field silently falls back to its default.
+
+Theme is applied per-element through the `isDark` ternaries in `page.tsx`
+rather than a global dark-mode class, so any new surface needs both branches —
+a hardcoded `text-white` disappears in light mode. `bg`, `textCol`, `subText`,
+`barBg`, `panelBg` and `hoverBg` are the shared tokens to reuse.
+
+Wide mode renders `pageGroups`, which pairs consecutive pages; the pairing is
+why page lookup in the scroll handler indexes images rather than groups. Bars
+hide on downward scroll via `chromeHidden` and reveal on any upward move.
