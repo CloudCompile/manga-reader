@@ -7,6 +7,8 @@
 // A CORS/captcha worker proxy is used as a fallback whenever a direct fetch is
 // blocked (Cloudflare "Just a moment..." interstitials, bot walls, ...).
 
+import { TtlCache } from "./cache";
+
 export interface RawChapter {
   title: string;
   mangaName: string;
@@ -1187,10 +1189,10 @@ export function isSupported(url: string): boolean {
 // Public operations
 // ───────────────────────────────────────────────────────────
 
-const CHAPTER_CACHE = new Map<string, { data: ChapterData; ts: number }>();
-const LIST_CACHE = new Map<string, { data: ChapterListData; ts: number }>();
-const SEARCH_CACHE = new Map<string, { data: SearchResult[]; ts: number }>();
 const TTL = 10 * 60 * 1000;
+const CHAPTER_CACHE = new TtlCache<string, ChapterData>({ ttlMs: TTL, maxEntries: 500 });
+const LIST_CACHE = new TtlCache<string, ChapterListData>({ ttlMs: TTL, maxEntries: 200 });
+const SEARCH_CACHE = new TtlCache<string, SearchResult[]>({ ttlMs: TTL, maxEntries: 100 });
 
 function fillNavFromList(raw: RawChapter, chapters: ChapterItem[], url: string): void {
   if (!chapters.length) return;
@@ -1208,7 +1210,7 @@ function fillNavFromList(raw: RawChapter, chapters: ChapterItem[], url: string):
 
 export async function scrapeChapter(url: string): Promise<ChapterData> {
   const cached = CHAPTER_CACHE.get(url);
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  if (cached) return cached;
 
   const source = getSource(url);
   if (!source) throw new Error("This site is not supported yet.");
@@ -1240,7 +1242,7 @@ export async function scrapeChapter(url: string): Promise<ChapterData> {
   if (data.images.length === 0) {
     data.warning = data.warning || "No images found. This chapter may not be available yet.";
   }
-  CHAPTER_CACHE.set(url, { data, ts: Date.now() });
+  CHAPTER_CACHE.set(url, data);
   return data;
 }
 
@@ -1251,7 +1253,7 @@ export async function fetchChapterList(url: string): Promise<ChapterListData> {
   const slug = source.seriesKey(url);
   const cacheKey = `${source.id}:${slug}`;
   const cached = LIST_CACHE.get(cacheKey);
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  if (cached) return cached;
 
   let chapters: ChapterItem[] = [];
   let mangaName = source.name;
@@ -1292,7 +1294,7 @@ export async function fetchChapterList(url: string): Promise<ChapterListData> {
   }
 
   const data: ChapterListData = { mangaName, chapters, volumes };
-  LIST_CACHE.set(cacheKey, { data, ts: Date.now() });
+  LIST_CACHE.set(cacheKey, data);
   return data;
 }
 
@@ -1300,7 +1302,7 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
   const q = query.trim().toLowerCase();
   const cacheKey = `search:${q}`;
   const cached = SEARCH_CACHE.get(cacheKey);
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  if (cached) return cached;
 
   const tasks = SOURCES.map(async (source) => {
     if (source.search) {
@@ -1346,7 +1348,7 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
   const settled = await Promise.allSettled(tasks);
   const out: SearchResult[] = [];
   for (const s of settled) if (s.status === "fulfilled") out.push(...s.value);
-  SEARCH_CACHE.set(cacheKey, { data: out, ts: Date.now() });
+  SEARCH_CACHE.set(cacheKey, out);
   return out;
 }
 
@@ -1354,7 +1356,7 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
 // Title listing
 // ───────────────────────────────────────────────────────────
 
-const TITLE_CACHE = new Map<string, { data: TitleItem[]; ts: number }>();
+const TITLE_CACHE = new TtlCache<string, TitleItem[]>({ ttlMs: TTL, maxEntries: 50 });
 
 // Group a listing page's chapter links into the distinct series it mentions.
 async function titlesFromListing(source: Source): Promise<TitleItem[]> {
@@ -1453,9 +1455,9 @@ export async function listTitlesWithHealth(): Promise<CatalogueResult> {
 
 export async function listTitles(): Promise<TitleItem[]> {
   const cached = TITLE_CACHE.get("all");
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  if (cached) return cached;
   const { titles } = await listTitlesWithHealth();
-  TITLE_CACHE.set("all", { data: titles, ts: Date.now() });
+  TITLE_CACHE.set("all", titles);
   return titles;
 }
 
@@ -1583,14 +1585,14 @@ async function findMangaDexMatch(mangaName: string): Promise<MangaDexMatch | nul
   return best;
 }
 
-const VOLUME_CACHE = new Map<string, { data: Map<number, string> | null; ts: number }>();
+const VOLUME_CACHE = new TtlCache<string, Map<number, string> | null>({ ttlMs: TTL, maxEntries: 200 });
 
 // chapter number -> volume number, or null when no confident match exists.
 async function mangadexChapterVolumes(mangaName: string): Promise<Map<number, string> | null> {
   const key = normTitle(mangaName);
   if (!key) return null;
   const cached = VOLUME_CACHE.get(key);
-  if (cached && Date.now() - cached.ts < TTL) return cached.data;
+  if (cached !== undefined) return cached;
 
   let map: Map<number, string> | null = null;
   try {
@@ -1616,7 +1618,7 @@ async function mangadexChapterVolumes(mangaName: string): Promise<Map<number, st
   } catch {
     map = null;
   }
-  VOLUME_CACHE.set(key, { data: map, ts: Date.now() });
+  VOLUME_CACHE.set(key, map);
   return map;
 }
 

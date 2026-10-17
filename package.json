@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "next dev -p 12000",
     "build": "next build",
-    "start": "next start"
+    "start": "next start -p 12000",
+    "test": "node --import ./tests/register.mjs tests/all.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@radix-ui/react-scroll-area": "^1.2.9",

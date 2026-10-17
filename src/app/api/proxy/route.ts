@@ -1,8 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PROXY_BASE } from "@/lib/sources";
+import { TtlCache } from "@/lib/cache";
 
-const CACHE = new Map<string, { buf: ArrayBuffer; ct: string; ts: number }>();
 const CACHE_TTL = 30 * 60 * 1000;
+// Roughly 100 pages of ~250KB, or a few large spreads. Without a ceiling the
+// process holds every proxied image forever on a long-lived server.
+const CACHE_MAX_BYTES = 256 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+// Redirect chains are followed by hand so every hop can be re-checked; this is
+// the ceiling on how many we follow.
+const MAX_REDIRECTS = 5;
+
+const CACHE = new TtlCache<string, { buf: ArrayBuffer; ct: string }>({
+  ttlMs: CACHE_TTL,
+  maxEntries: 2000,
+  maxBytes: CACHE_MAX_BYTES,
+  sizeOf: (v) => v.buf.byteLength,
+});
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
@@ -24,9 +38,9 @@ function isPrivateHost(host: string): boolean {
   );
 }
 
-function okImageUrl(raw: string): URL | null {
+function okImageUrl(raw: string, base?: string): URL | null {
   try {
-    const u = new URL(raw);
+    const u = new URL(raw, base);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
     if (isPrivateHost(u.hostname)) return null;
     return u;
@@ -45,6 +59,64 @@ function imageResponse(buf: ArrayBuffer, ct: string) {
   });
 }
 
+async function fetchOnce(url: string, referer: string): Promise<Response> {
+  return fetch(url, {
+    headers: { "User-Agent": UA, Referer: referer, Accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
+    cache: "no-store",
+    redirect: "manual",
+  });
+}
+
+// Follow redirects one hop at a time, refusing any hop that lands on a private
+// address. `fetch` with the default redirect mode would follow a public URL to
+// 127.0.0.1 (or a cloud metadata endpoint) without ever re-running the check.
+async function fetchFollowingSafe(url: URL, referer: string): Promise<Response> {
+  let current = url;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const resp = await fetchOnce(current.href, referer);
+    const isRedirect = resp.status >= 300 && resp.status < 400;
+    if (!isRedirect) return resp;
+    const location = resp.headers.get("location");
+    if (!location) return resp;
+    const next = okImageUrl(location, current.href);
+    if (!next) throw new Error("Redirect left the public internet");
+    current = next;
+  }
+  throw new Error("Too many redirects");
+}
+
+// Read the body while enforcing a byte ceiling, so an endless or oversized
+// upstream cannot exhaust memory.
+async function readCapped(resp: Response, limit: number): Promise<ArrayBuffer | null> {
+  const declared = Number(resp.headers.get("content-length") || "0");
+  if (declared > limit) return null;
+  if (!resp.body) {
+    const buf = await resp.arrayBuffer();
+    return buf.byteLength > limit ? null : buf;
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
+}
+
 export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get("url");
   if (!raw) return NextResponse.json({ error: "url param required" }, { status: 400 });
@@ -54,38 +126,38 @@ export async function GET(req: NextRequest) {
   const key = target.href;
 
   const cached = CACHE.get(key);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) return imageResponse(cached.buf, cached.ct);
+  if (cached) return imageResponse(cached.buf, cached.ct);
 
   const referer = req.nextUrl.searchParams.get("ref") || `${target.origin}/`;
-
-  async function attempt(url: string): Promise<Response> {
-    return fetch(url, {
-      headers: { "User-Agent": UA, Referer: referer, Accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
-      cache: "no-store",
-    });
-  }
 
   try {
     let resp: Response;
     try {
-      resp = await attempt(key);
+      resp = await fetchFollowingSafe(target, referer);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     } catch {
       // Retry through the CORS/captcha worker proxy.
-      resp = await attempt(`${PROXY_BASE}/?url=${encodeURIComponent(key)}`);
+      resp = await fetch(`${PROXY_BASE}/?url=${encodeURIComponent(key)}`, {
+        headers: { "User-Agent": UA, Referer: referer, Accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
+        cache: "no-store",
+      });
     }
 
     if (!resp.ok) return new NextResponse("Image fetch failed", { status: resp.status });
 
-    const buf = await resp.arrayBuffer();
     const ct = resp.headers.get("content-type") || "image/jpeg";
     if (!ct.startsWith("image/") && !ct.startsWith("application/octet-stream")) {
       return new NextResponse("Upstream did not return an image", { status: 502 });
     }
-    CACHE.set(key, { buf, ct, ts: Date.now() });
+
+    const buf = await readCapped(resp, MAX_IMAGE_BYTES);
+    if (!buf) return new NextResponse("Image too large", { status: 502 });
+
+    CACHE.set(key, { buf, ct });
     return imageResponse(buf, ct);
   } catch (err) {
     console.error("Proxy error:", err);
     return NextResponse.json({ error: "Failed to fetch image" }, { status: 502 });
   }
 }
+
