@@ -28,6 +28,18 @@ export interface HistoryEntry {
   page?: number;
 }
 
+export type FitMode = "width" | "height" | "original";
+
+// Reader defaults remembered per series. RTL and fit are properties of the
+// series rather than of the reader, so a right-to-left title should open that
+// way every time instead of the reader flipping it on each visit.
+export interface SeriesPrefs {
+  rtl?: boolean;
+  fitMode?: FitMode;
+  paged?: boolean;
+  wide?: boolean;
+}
+
 export interface StoredState {
   history: HistoryEntry[];
   // Titles the reader deliberately kept, in the order they were added. Separate
@@ -36,12 +48,17 @@ export interface StoredState {
   list: HistoryEntry[];
   lastRead: string | null;
   theme: "dark" | "light";
-  fitMode: "width" | "height" | "original";
+  fitMode: FitMode;
   wide: boolean;
   // Reading layout: continuous vertical scroll (the default) or one page per
   // screen. rtl flips the page-turn direction for right-to-left manga.
   paged: boolean;
   rtl: boolean;
+  // Highest chapter number read per series key ("sourceId:seriesSlug"). Drives
+  // the read ticks in the chapter list and the "next unread" jump.
+  read: Record<string, number>;
+  // Per-series reader defaults, keyed the same way as `read`.
+  seriesPrefs: Record<string, SeriesPrefs>;
 }
 
 interface PackedEntry {
@@ -72,6 +89,10 @@ const MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_COOKIE_LEN = 3800;
 const MAX_HISTORY = 30;
 const MAX_LIST = 50;
+// The read map and per-series prefs share the settings cookie, so both are
+// capped to keep it inside the ~4KB browser limit.
+const MAX_READ = 60;
+const MAX_SERIES_PREFS = 25;
 
 const DEFAULT_STATE: StoredState = {
   history: [],
@@ -82,6 +103,8 @@ const DEFAULT_STATE: StoredState = {
   wide: false,
   paged: false,
   rtl: false,
+  read: {},
+  seriesPrefs: {},
 };
 
 let memoryState: StoredState = { ...DEFAULT_STATE };
@@ -187,6 +210,29 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
     }
   }
 
+  // Both maps are keyed by user-derived strings, so only well-typed entries are
+  // kept; a corrupted cookie degrades to an empty map instead of throwing.
+  const read: Record<string, number> = {};
+  if (settings.read && typeof settings.read === "object") {
+    for (const [k, v] of Object.entries(settings.read)) {
+      if (typeof v === "number" && isFinite(v)) read[k] = v;
+    }
+  }
+  const seriesPrefs: Record<string, SeriesPrefs> = {};
+  if (settings.seriesPrefs && typeof settings.seriesPrefs === "object") {
+    for (const [k, v] of Object.entries(settings.seriesPrefs)) {
+      if (!v || typeof v !== "object") continue;
+      const p = v as SeriesPrefs;
+      const entry: SeriesPrefs = {};
+      if (typeof p.rtl === "boolean") entry.rtl = p.rtl;
+      if (p.fitMode === "width" || p.fitMode === "height" || p.fitMode === "original")
+        entry.fitMode = p.fitMode;
+      if (typeof p.paged === "boolean") entry.paged = p.paged;
+      if (typeof p.wide === "boolean") entry.wide = p.wide;
+      if (Object.keys(entry).length) seriesPrefs[k] = entry;
+    }
+  }
+
   try {
     // Legacy v1: history, settings and absolute URLs all in one cookie, with no
     // reading list. Recognised by the absence of the v2 origin pool.
@@ -203,6 +249,8 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
           wide: legacy.wide === true,
           paged: legacy.paged === true,
           rtl: legacy.rtl === true,
+          read,
+          seriesPrefs,
         };
       }
     }
@@ -222,6 +270,8 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
     wide: settings.wide === true,
     paged: settings.paged === true,
     rtl: settings.rtl === true,
+    read,
+    seriesPrefs,
   };
 }
 
@@ -348,12 +398,39 @@ function persist(state: StoredState): void {
       wide: state.wide,
       paged: state.paged,
       rtl: state.rtl,
+      read: capRead(state.read),
+      seriesPrefs: capSeriesPrefs(state.seriesPrefs),
     })
   );
 
   // Keep memory in step with what was actually stored; otherwise the session
   // shows entries that the next reload will not have.
-  memoryState = { ...state, history: historyFit.entries, list: listFit.entries };
+  memoryState = {
+    ...state,
+    history: historyFit.entries,
+    list: listFit.entries,
+    read: capRead(state.read),
+    seriesPrefs: capSeriesPrefs(state.seriesPrefs),
+  };
+}
+
+// Keeps the most recently touched entries when a map grows past its cap. The
+// maps have no timestamps, so insertion order stands in for recency: callers
+// rebuild the object with the newest key last.
+function capRead(read: Record<string, number>): Record<string, number> {
+  const keys = Object.keys(read);
+  if (keys.length <= MAX_READ) return read;
+  const out: Record<string, number> = {};
+  for (const k of keys.slice(keys.length - MAX_READ)) out[k] = read[k];
+  return out;
+}
+
+function capSeriesPrefs(prefs: Record<string, SeriesPrefs>): Record<string, SeriesPrefs> {
+  const keys = Object.keys(prefs);
+  if (keys.length <= MAX_SERIES_PREFS) return prefs;
+  const out: Record<string, SeriesPrefs> = {};
+  for (const k of keys.slice(keys.length - MAX_SERIES_PREFS)) out[k] = prefs[k];
+  return out;
 }
 
 export function loadState(): StoredState {
@@ -467,4 +544,58 @@ export function setPage(url: string, page: number): void {
   const state = loadState();
   const history = state.history.map((h) => (h.url === url ? { ...h, page } : h));
   persist({ ...state, history });
+}
+
+// ─── Read progress per series ─────────────────────────
+//
+// The highest chapter number opened in a series. A chapter at or below this
+// counts as read, which is what the chapter-list ticks and the "next unread"
+// jump use. Keyed by "sourceId:seriesSlug" so it survives the URL changing
+// shape between sources.
+
+export function getRead(): Record<string, number> {
+  return loadState().read;
+}
+
+// Bumps the stored progress for a series, never lowering it, and returns the
+// updated map. Re-reading an early chapter must not mark later ones unread.
+export function markRead(seriesKey: string, chapterNum: number): Record<string, number> {
+  if (!seriesKey || !isFinite(chapterNum) || chapterNum <= 0) return getRead();
+  const state = loadState();
+  const current = state.read[seriesKey] || 0;
+  if (chapterNum <= current) return state.read;
+  // Rebuild with the touched key last so the cap drops the coldest series.
+  const read: Record<string, number> = {};
+  for (const [k, v] of Object.entries(state.read)) if (k !== seriesKey) read[k] = v;
+  read[seriesKey] = chapterNum;
+  persist({ ...state, read });
+  return loadState().read;
+}
+
+// ─── Per-series reader defaults ───────────────────────
+
+export function getSeriesPrefs(seriesKey: string): SeriesPrefs {
+  if (!seriesKey) return {};
+  return loadState().seriesPrefs[seriesKey] || {};
+}
+
+export function setSeriesPrefs(seriesKey: string, patch: SeriesPrefs): SeriesPrefs {
+  if (!seriesKey) return {};
+  const state = loadState();
+  const merged: SeriesPrefs = { ...state.seriesPrefs[seriesKey], ...patch };
+  const seriesPrefs: Record<string, SeriesPrefs> = {};
+  for (const [k, v] of Object.entries(state.seriesPrefs)) if (k !== seriesKey) seriesPrefs[k] = v;
+  seriesPrefs[seriesKey] = merged;
+  persist({ ...state, seriesPrefs });
+  return merged;
+}
+
+// Wipes every persisted value, for the "clear data" action. A no-op for the
+// in-memory fallback beyond resetting the session copy.
+export function clearAll(): void {
+  memoryState = { ...DEFAULT_STATE };
+  loaded = true;
+  writeCookie(COOKIE, "");
+  writeCookie(LIST_COOKIE, "");
+  writeCookie(SETTINGS_COOKIE, "");
 }

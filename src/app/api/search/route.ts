@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { searchAll } from "@/lib/sources";
+import { withRateLimit } from "@/lib/ratelimit";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: NextRequest) {
+// Search fans out to every source at once, so it is throttled like the scrape
+// route (30 requests/minute per client).
+async function handler(req: NextRequest) {
   try {
     const query = req.nextUrl.searchParams.get("q") || "";
     const results = await searchAll(query);
@@ -14,3 +17,5 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const GET = withRateLimit(handler, 30);

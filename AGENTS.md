@@ -35,11 +35,23 @@ body rather than skipping the release.
   `cors-proxy.christopher-j-hauser2025.workers.dev` worker (`PROXY_BASE`).
 - API routes: `/api/scrape`, `/api/chapters`, `/api/search`, `/api/titles`,
   `/api/proxy`. The proxy route is what serves chapter images to the browser.
+  Versioned aliases for the four data routes live under `/api/v1/*` and must
+  stay in step with their `/api` counterparts; they are the stable surface.
+- `src/lib/ratelimit.ts` — in-memory fixed-window limiter (`withRateLimit`).
+  Applied to scrape, chapters and search. `/api/proxy` is deliberately exempt:
+  one chapter view fetches dozens of images, so a per-request cap there would
+  break normal reading. `withRateLimit` is generic over the handler's own
+  parameter list so the wrapped export still satisfies Next's route types.
+- `src/lib/opds.ts` + `src/app/opds/{,all,shelf,search}` — OPDS catalogue for
+  external reader apps. `acquisitionFeed` escapes every field; a raw `&` in a
+  title silently breaks the XML, so titles/aliases go through the escaper.
 - `src/lib/storage.ts` — persistence is **cookie-only** (`Secure; SameSite=Lax`)
   with an in-memory fallback. There is no localStorage/IndexedDB/sessionStorage
   and there must never be: the target is constrained Android WebViews where
   cookies are also unreliable, so the in-memory fallback has to keep working
-  and nothing may throw.
+  and nothing may throw. History, the reading list, preferences and the
+  per-series read map live in one cookie; per-series reader defaults live in
+  the prefs cookie. Every field is capped so no cookie exceeds ~4 KB.
 
 ## Site-specific quirks
 - Eight supported sources. All except allmanga, specterscans and ffb host
@@ -138,6 +150,27 @@ Icon-only buttons carry `aria-label` (not just `title`), toggles carry
 hand-rolled buttons carry `focus-visible:outline`. New icon buttons should
 follow suit. Bars pad for notches with `env(safe-area-inset-*)`, and mobile
 controls use `p-2.5` tap targets rather than `p-1.5`.
+
+## Aliases and catalogue ordering
+
+`listCuratedTitlesWithHealth` enriches each shelf entry with alternate titles
+from MangaDex (`aliasesFor`), so a romaji or translated name finds the title in
+search. The lookups are bounded two ways — concurrency (`ALIAS_CONCURRENCY`) and
+an overall deadline (`ALIAS_BUDGET_MS`) — because MangaDex has a low per-IP
+budget and the shelf must not wait on it. Entries that miss the deadline simply
+carry no aliases. `sortTitles` and `titleMatches` live in `sources.ts` (not the
+route) so the Node tests can exercise them without resolving the `@/` alias.
+
+## PWA / offline
+
+`src/app/manifest.ts` and `public/sw.js` make the app installable. The service
+worker caches the shell (network-first, so a new build is never masked by a
+stale one) and proxied page images (cache-first, bounded to `MAX_IMAGES`). Only
+`image/*` responses are cached, so a 502 error body is never pinned. The
+reader's "Cache" button (`prefetchChapterPages`) deliberately pulls every page of
+the open chapter through the proxy. `ServiceWorkerRegistrar` registers it
+best-effort and swallows every failure, since a browser without service workers
+must keep working.
 
 ## Reader and theming
 

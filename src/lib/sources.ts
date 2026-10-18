@@ -57,6 +57,10 @@ export interface TitleItem {
   latestChapter: string;
   totalChapters: number;
   thumbnail?: string;
+  // Alternate and romanised names, so a search for "Attack on Titan" matches a
+  // shelf entry slugged "shingeki-no-kyojin". Populated where a lookup is
+  // affordable (the curated shelf), best-effort elsewhere.
+  aliases?: string[];
 }
 
 // Titles featured on the home shelf, in display order. These are Spectre Scans
@@ -1303,11 +1307,45 @@ export async function fetchChapterList(url: string): Promise<ChapterListData> {
   return data;
 }
 
+// Expand a query with the alternate titles MangaDex knows for it, so a search
+// for "Attack on Titan" also matches an entry slugged "shingeki-no-kyojin".
+// Exactly one lookup per query, cached, and it degrades to the bare query when
+// MangaDex is unreachable — never a per-candidate fan-out.
+async function queryVariants(query: string): Promise<string[]> {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const variants = new Set<string>([q]);
+  try {
+    const match = await findMangaDexMatch(query);
+    for (const t of match?.titles || []) {
+      const n = t.trim().toLowerCase();
+      if (n) variants.add(n);
+    }
+  } catch {
+    /* fall back to the bare query */
+  }
+  return Array.from(variants);
+}
+
+// A candidate matches when any variant is a substring of it (or vice versa) or
+// the titles are close enough by token overlap.
+function matchesVariants(name: string, variants: string[]): boolean {
+  const lower = name.toLowerCase();
+  for (const v of variants) {
+    if (!v) continue;
+    if (lower.includes(v) || v.includes(lower)) return true;
+    if (titleScore(name, v) >= VOLUME_MIN_SCORE) return true;
+  }
+  return false;
+}
+
 export async function searchAll(query: string): Promise<SearchResult[]> {
   const q = query.trim().toLowerCase();
   const cacheKey = `search:${q}`;
   const cached = SEARCH_CACHE.get(cacheKey);
   if (cached) return cached;
+
+  const variants = await queryVariants(query);
 
   const tasks = SOURCES.map(async (source) => {
     if (source.search) {
@@ -1339,7 +1377,7 @@ export async function searchAll(query: string): Promise<SearchResult[]> {
         const results: SearchResult[] = [];
         for (const [slug, best] of bySeries) {
           const name = titleFromSlug(slug);
-          if (q && !name.toLowerCase().includes(q)) continue;
+          if (q && !matchesVariants(name, variants)) continue;
           results.push({ title: name, latestChapter: `Ch ${best.num}`, url: best.url, source: source.name });
         }
         return results;
@@ -1466,6 +1504,36 @@ export async function listTitles(): Promise<TitleItem[]> {
   return titles;
 }
 
+export type TitleSort = "shelf" | "title" | "chapters" | "latest";
+
+// Orders the catalogue for the API. "shelf" preserves the incoming order (the
+// curated shelf / source grouping); the rest are explicit user choices.
+export function sortTitles(titles: TitleItem[], sort: TitleSort): TitleItem[] {
+  const copy = [...titles];
+  if (sort === "chapters") {
+    copy.sort((a, b) => b.totalChapters - a.totalChapters || a.title.localeCompare(b.title));
+  } else if (sort === "latest") {
+    // latestChapter is a display string ("Ch 199"); compare the numeric part so
+    // "Ch 100" sorts above "Ch 99" rather than by string order.
+    const num = (t: TitleItem) => {
+      const m = t.latestChapter.match(/([0-9]+(?:\.[0-9]+)?)/);
+      return m ? parseFloat(m[1]) : 0;
+    };
+    copy.sort((a, b) => num(b) - num(a) || a.title.localeCompare(b.title));
+  } else if (sort === "title") {
+    copy.sort((a, b) => a.title.localeCompare(b.title));
+  }
+  return copy;
+}
+
+// True when the title matches the query by display name or any known alias.
+export function titleMatches(t: TitleItem, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if (t.title.toLowerCase().includes(q)) return true;
+  return (t.aliases || []).some((a) => a.toLowerCase().includes(q));
+}
+
 // The home shelf: the hand-picked Spectre titles in CURATED_TITLES order, plus
 // the single-series sources (Komi, Blue Box, …) which are always worth showing.
 // Entries the catalogue no longer carries are skipped.
@@ -1487,6 +1555,10 @@ export async function listCuratedTitles(): Promise<TitleItem[]> {
 
 // The shelf also reports source health, so a source that failed while building
 // it is visible on the default view and not only in the full catalogue.
+//
+// Alias lookup is bounded: only the curated shelf is enriched (a handful of
+// titles), and each lookup is cached and swallows its own failure, so the shelf
+// never waits on MangaDex being reachable.
 export async function listCuratedTitlesWithHealth(): Promise<CatalogueResult> {
   const { titles: all, sources } = await listTitlesWithHealth();
   const bySlug = new Map<string, TitleItem>();
@@ -1506,7 +1578,40 @@ export async function listCuratedTitlesWithHealth(): Promise<CatalogueResult> {
   }
   // Stable ordering keeps the shelf from reshuffling between loads.
   standalone.sort((a, b) => a.title.localeCompare(b.title));
-  return { titles: out.concat(standalone), sources };
+  const shelf = out.concat(standalone);
+  await populateAliases(shelf);
+  return { titles: shelf, sources };
+}
+
+// Attaches alternate titles to the shelf entries.
+//
+// MangaDex is a third party with a low per-IP budget, so the lookups are run
+// with a small concurrency limit rather than all at once, and the whole batch is
+// capped by a deadline. A slow or rate-limited MangaDex therefore costs the
+// shelf a little enrichment, never a delayed first paint: entries that miss the
+// deadline simply carry no aliases.
+const ALIAS_CONCURRENCY = 3;
+const ALIAS_BUDGET_MS = 2000;
+
+async function populateAliases(titles: TitleItem[]): Promise<void> {
+  if (titles.length === 0) return;
+  let next = 0;
+  const worker = async () => {
+    while (next < titles.length) {
+      const t = titles[next++];
+      const aliases = await aliasesFor(t.title);
+      if (aliases.length) t.aliases = aliases;
+    }
+  };
+  const run = Promise.all(Array.from({ length: Math.min(ALIAS_CONCURRENCY, titles.length) }, worker));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ALIAS_BUDGET_MS);
+  });
+  // The workers keep running after the budget expires, so their results are
+  // still cached for the next request; only the response stops waiting.
+  await Promise.race([run.then(() => undefined), budget]);
+  if (timer) clearTimeout(timer);
 }
 
 // ───────────────────────────────────────────────────────────
@@ -1555,6 +1660,8 @@ interface MangaDexMatch {
   id: string;
   title: string;
   score: number;
+  // Every title the match carries (primary + alternates), used for aliases.
+  titles: string[];
 }
 
 function allTitles(m: {
@@ -1585,9 +1692,40 @@ async function findMangaDexMatch(mangaName: string): Promise<MangaDexMatch | nul
     for (const t of titles) score = Math.max(score, titleScore(mangaName, t));
     if (score < VOLUME_MIN_SCORE) continue;
     const primary = Object.values(m.attributes?.title || {})[0] || titles[0];
-    if (!best || score > best.score) best = { id: m.id, title: primary, score };
+    if (!best || score > best.score) best = { id: m.id, title: primary, score, titles };
   }
   return best;
+}
+
+// Alternate and romanised names for a series, from the same MangaDex lookup the
+// volume grouping uses. Cached, and returns an empty list when no confident
+// match exists, so a wrong alias is never invented.
+const ALIAS_CACHE = new TtlCache<string, string[]>({ ttlMs: TTL, maxEntries: 200 });
+
+export async function aliasesFor(mangaName: string): Promise<string[]> {
+  const key = normTitle(mangaName);
+  if (!key) return [];
+  const cached = ALIAS_CACHE.get(key);
+  if (cached !== undefined) return cached;
+  let out: string[] = [];
+  try {
+    const match = await findMangaDexMatch(mangaName);
+    if (match) {
+      const seen = new Set<string>([normTitle(mangaName)]);
+      for (const t of match.titles) {
+        const n = normTitle(t);
+        // Keep only real alternates: drop blanks, duplicates and reprint labels.
+        if (!n || seen.has(n) || VOLUME_EXCLUDE.test(t)) continue;
+        seen.add(n);
+        out.push(t);
+      }
+      out = out.slice(0, 8);
+    }
+  } catch {
+    out = [];
+  }
+  ALIAS_CACHE.set(key, out);
+  return out;
 }
 
 const VOLUME_CACHE = new TtlCache<string, Map<number, string> | null>({ ttlMs: TTL, maxEntries: 200 });

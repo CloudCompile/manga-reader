@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { scrapeChapter, isSupported } from "@/lib/sources";
+import { withRateLimit } from "@/lib/ratelimit";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(req: NextRequest) {
+// Scraping fans out to a third-party site, so it is the most expensive route
+// and the one most worth throttling (30 requests/minute per client).
+async function handler(req: NextRequest) {
   try {
     const { url } = await req.json();
     if (!url || typeof url !== "string") {
@@ -26,3 +29,5 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const POST = withRateLimit(handler, 30);

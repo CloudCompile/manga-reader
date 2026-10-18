@@ -3,9 +3,12 @@ import { summary } from "./harness.ts";
 import * as cache from "./cache.test.ts";
 import * as storage from "./storage.test.ts";
 import * as sources from "./sources.test.ts";
+import * as ratelimit from "./ratelimit.test.ts";
+import * as opds from "./opds.test.ts";
+import * as titles from "./titles.test.ts";
 
 async function main(): Promise<void> {
-  for (const mod of [cache, storage, sources]) {
+  for (const mod of [cache, storage, sources, ratelimit, opds, titles]) {
     await mod.run();
   }
   process.exit(summary());

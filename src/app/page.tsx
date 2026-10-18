@@ -29,6 +29,12 @@ import {
   BookmarkCheck,
   BookmarkPlus,
   ArrowLeftRight,
+  Check,
+  Download,
+  BarChart3,
+  Trash2,
+  ArrowDownUp,
+  RotateCcw,
 } from "lucide-react";
 import {
   getHistory,
@@ -49,7 +55,13 @@ import {
   getList,
   toggleInList,
   removeFromList,
+  getRead,
+  markRead,
+  getSeriesPrefs,
+  setSeriesPrefs,
+  clearAll,
   type HistoryEntry,
+  type SeriesPrefs,
 } from "@/lib/storage";
 
 // ─── Types ───────────────────────────────────────────
@@ -61,6 +73,7 @@ interface ChapterData {
   mangaName: string;
   chapterNum: string;
   seriesSlug: string;
+  sourceId?: string;
   sourceName?: string;
   warning?: string;
 }
@@ -87,6 +100,7 @@ interface TitleItem {
   latestChapter: string;
   totalChapters: number;
   thumbnail?: string;
+  aliases?: string[];
 }
 
 interface SourceHealth {
@@ -116,6 +130,7 @@ type Theme = "dark" | "light";
 type FitMode = "width" | "height" | "original";
 type GroupMode = "chapter" | "volume";
 type CatalogueScope = "shelf" | "all";
+type SortKey = "shelf" | "title" | "chapters" | "latest";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
@@ -198,6 +213,39 @@ function warmLookahead(images: string[], fromIndex: number) {
   WARMED_PER_CHAPTER.set(images, warmed);
 }
 
+// Pages already fetched in full by the "prefetch chapter" action, so a second
+// request is a no-op. Session-only, like the other caches.
+const PREFETCHED_PAGES = new Set<string>();
+
+// Deliberately fetch every page of a chapter through the proxy, so a long read
+// on a bad connection does not stall at each screen boundary. Returns the number
+// of pages warmed. Bounded by the caller (see PREFETCH_MAX_PAGES).
+async function prefetchChapterPages(
+  chapterUrl: string,
+  images: string[],
+  onProgress?: (done: number, total: number) => void
+): Promise<number> {
+  if (PREFETCHED_PAGES.has(chapterUrl)) return 0;
+  PREFETCHED_PAGES.add(chapterUrl);
+  let done = 0;
+  for (const src of images) {
+    try {
+      await new Promise<void>((resolve) => {
+        const img = new Image();
+        img.decoding = "async";
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+        img.src = PROXY(src);
+      });
+    } catch {
+      /* one failed page must not stop the rest */
+    }
+    done += 1;
+    onProgress?.(done, images.length);
+  }
+  return done;
+}
+
 // ─── Component ───────────────────────────────────────
 export default function MangaReader() {
   const [url, setUrl] = useState("");
@@ -245,6 +293,18 @@ export default function MangaReader() {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [chromeHidden, setChromeHidden] = useState(false);
+  // Catalogue sort/filter controls (#4).
+  const [sortKey, setSortKey] = useState<SortKey>("shelf");
+  const [hideEmpty, setHideEmpty] = useState(false);
+  // Mark-as-read progress, keyed "sourceId:seriesSlug" (#5).
+  const [readMap, setReadMap] = useState<Record<string, number>>({});
+  // Chapter-list filter and jump-to-number (#7).
+  const [chapterFilter, setChapterFilter] = useState("");
+  const [chapterJump, setChapterJump] = useState("");
+  // Whole-chapter prefetch progress (#6). null when idle.
+  const [prefetchProgress, setPrefetchProgress] = useState<{ done: number; total: number } | null>(null);
+  // Reading stats panel (#10).
+  const [showStats, setShowStats] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const imgRefs = useRef<Map<number, HTMLImageElement>>(new Map());
@@ -270,6 +330,7 @@ export default function MangaReader() {
     setPaged(getPaged());
     setRtl(getRtl());
     setReadingList(getList());
+    setReadMap(getRead());
   }, []);
 
   // Catalogue loader. "shelf" is the small curated set that paints fast;
@@ -282,9 +343,16 @@ export default function MangaReader() {
   const loadCatalogue = useCallback(
     async (
       nextScope: CatalogueScope,
-      opts: { append?: boolean; offset?: number; source?: string; query?: string } = {}
+      opts: {
+        append?: boolean;
+        offset?: number;
+        source?: string;
+        query?: string;
+        sort?: SortKey;
+        hideEmpty?: boolean;
+      } = {}
     ) => {
-      const { append = false, offset = 0, source = "all", query = "" } = opts;
+      const { append = false, offset = 0, source = "all", query = "", sort = "shelf", hideEmpty: hide = false } = opts;
       if (append) setLoadingMore(true);
       else setTitlesLoading(true);
       if (!append) setTitlesError("");
@@ -295,6 +363,8 @@ export default function MangaReader() {
           params.set("offset", String(offset));
           if (source !== "all") params.set("source", source);
           if (query) params.set("q", query);
+          if (sort !== "shelf") params.set("sort", sort);
+          if (hide) params.set("hideEmpty", "1");
         }
         const res = await fetch(`/api/titles?${params}`);
         const json: TitlesResponse = await res.json();
@@ -326,10 +396,10 @@ export default function MangaReader() {
     if (scope !== "all") return;
     const t = window.setTimeout(() => {
       setTitles([]);
-      loadCatalogue("all", { source: titleSource, query: titleQuery.trim() });
+      loadCatalogue("all", { source: titleSource, query: titleQuery.trim(), sort: sortKey, hideEmpty });
     }, 250);
     return () => window.clearTimeout(t);
-  }, [scope, titleSource, titleQuery, loadCatalogue]);
+  }, [scope, titleSource, titleQuery, sortKey, hideEmpty, loadCatalogue]);
 
   // Typing in the search box searches everything, not just the shelf, so the
   // full catalogue is reachable without knowing about the scope tabs.
@@ -347,6 +417,7 @@ export default function MangaReader() {
     setTitles([]);
     setTitleSource("all");
     setTitleQuery("");
+    setSortKey("shelf");
     setScope(next);
   };
 
@@ -357,14 +428,16 @@ export default function MangaReader() {
       offset: titles.length,
       source: titleSource,
       query: titleQuery.trim(),
+      sort: sortKey,
+      hideEmpty,
     });
-  }, [loadingMore, catalogueHasMore, scope, titles.length, titleSource, titleQuery, loadCatalogue]);
+  }, [loadingMore, catalogueHasMore, scope, titles.length, titleSource, titleQuery, sortKey, hideEmpty, loadCatalogue]);
 
   // Retry keeps the active filters, so recovering from a failure does not
   // silently drop the source or search the user had applied.
   const retryCatalogue = () =>
     scope === "all"
-      ? loadCatalogue("all", { source: titleSource, query: titleQuery.trim() })
+      ? loadCatalogue("all", { source: titleSource, query: titleQuery.trim(), sort: sortKey, hideEmpty })
       : loadCatalogue("shelf");
 
   // Scroll listener: track the visible page, hide the chrome while reading
@@ -486,6 +559,7 @@ export default function MangaReader() {
         setShowSearch(false);
         setShowHistory(false);
         setShowSaved(false);
+        setShowStats(false);
         setShowPageJumper(false);
         setShowMobileMenu(false);
         setShowShortcuts(false);
@@ -579,6 +653,22 @@ export default function MangaReader() {
       setHistory(
         pushHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() })
       );
+
+      // Record reading progress for the series so the chapter list can tick
+      // read chapters and offer a "next unread" jump.
+      const seriesKey = `${json.sourceId || ""}:${json.seriesSlug || ""}`;
+      const num = parseFloat(json.chapterNum);
+      if (seriesKey && isFinite(num) && num > 0) {
+        setReadMap(markRead(seriesKey, num));
+      }
+
+      // Apply the series' remembered reader defaults (RTL, fit, layout) so a
+      // right-to-left title opens that way without a manual toggle each visit.
+      const prefs = getSeriesPrefs(seriesKey);
+      if (prefs.rtl !== undefined) setRtl(prefs.rtl);
+      if (prefs.fitMode) setFitMode(prefs.fitMode);
+      if (prefs.paged !== undefined) setPaged(prefs.paged);
+      if (prefs.wide !== undefined) setWide(prefs.wide);
 
       // Fetch chapter list in background for the sidebar and navigation.
       fetchChapterList(chapterUrl);
@@ -700,10 +790,38 @@ export default function MangaReader() {
     setReadingList(next);
   };
 
-  const chooseFitMode = (mode: FitMode) => { setFitMode(mode); persistFitMode(mode); };
-  const toggleWide = () => { const next = !wide; setWide(next); persistWide(next); };
-  const togglePaged = () => { const next = !paged; setPaged(next); persistPaged(next); };
-  const toggleRtl = () => { const next = !rtl; setRtl(next); persistRtl(next); };
+  const chooseFitMode = (mode: FitMode) => { setFitMode(mode); persistFitMode(mode); persistSeriesPref({ fitMode: mode }); };
+  const toggleWide = () => { const next = !wide; setWide(next); persistWide(next); persistSeriesPref({ wide: next }); };
+  const togglePaged = () => { const next = !paged; setPaged(next); persistPaged(next); persistSeriesPref({ paged: next }); };
+  const toggleRtl = () => { const next = !rtl; setRtl(next); persistRtl(next); persistSeriesPref({ rtl: next }); };
+  // Series key for the chapter currently open, matching the storage format.
+  const currentSeriesKey = data ? `${data.sourceId || ""}:${data.seriesSlug || ""}` : "";
+
+  // Remembers a reader default against the open series. Called from the
+  // toggles so flipping RTL once for a manga keeps it flipped on the next visit.
+  const persistSeriesPref = (patch: SeriesPrefs) => {
+    if (!currentSeriesKey) return;
+    setSeriesPrefs(currentSeriesKey, patch);
+  };
+
+  // Deliberately fetch every page of the open chapter through the proxy. Pages
+  // that already loaded are cheap cache hits; the point is to pull the rest
+  // before the reader reaches them on a slow connection.
+  const prefetchWholeChapter = async () => {
+    if (!data || !data.images.length || prefetchProgress) return;
+    setPrefetchProgress({ done: 0, total: data.images.length });
+    const done = await prefetchChapterPages(url, data.images, (d, total) =>
+      setPrefetchProgress({ done: d, total })
+    );
+    setPrefetchProgress(null);
+    setBanner({
+      kind: "info",
+      text: done
+        ? `Cached ${done} page${done === 1 ? "" : "s"} for offline reading.`
+        : "This chapter is already cached.",
+    });
+  };
+
   const toggleFullscreen = () => {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     else document.documentElement.requestFullscreen().catch(() => {});
@@ -880,7 +998,9 @@ export default function MangaReader() {
     return titles.filter(
       (t) =>
         (titleSource === "all" || t.sourceId === titleSource) &&
-        (!q || t.title.toLowerCase().includes(q))
+        // Match aliases as well as the display title, so a romaji search finds
+        // a title whose shelf name is in English.
+        (!q || t.title.toLowerCase().includes(q) || (t.aliases || []).some((a) => a.toLowerCase().includes(q)))
     );
   }, [titles, titleQuery, titleSource, scope]);
 
@@ -897,13 +1017,90 @@ export default function MangaReader() {
     [sourceHealth]
   );
 
+  // Per-title reading progress for the grid badges (#2). Titles are matched to
+  // history by series name, which is what both carry; the page is the furthest
+  // page reached in the most recent chapter of that series.
+  const progressBySeries = useMemo(() => {
+    const map = new Map<string, { chapterNum: string; page?: number; timestamp: number }>();
+    for (const h of history) {
+      const key = (h.mangaName || "").toLowerCase();
+      if (!key) continue;
+      const current = map.get(key);
+      if (!current || h.timestamp > current.timestamp) {
+        map.set(key, { chapterNum: h.chapterNum, page: h.page, timestamp: h.timestamp });
+      }
+    }
+    return map;
+  }, [history]);
+
+  // Reading stats (#10), computed from history alone — no extra storage.
+  const stats = useMemo(() => {
+    const chapters = history.length;
+    const pages = history.reduce((n, h) => n + (h.page || 0), 0);
+    const bySource = new Map<string, number>();
+    for (const h of history) {
+      let host = "other";
+      try {
+        host = new URL(h.url).hostname.replace(/^www\./, "");
+      } catch {
+        /* keep the fallback */
+      }
+      bySource.set(host, (bySource.get(host) || 0) + 1);
+    }
+    const top = Array.from(bySource.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    // Consecutive days with at least one chapter opened, counting back from the
+    // most recent day. Timestamps are local, so "day" means the reader's day.
+    const days = new Set(history.map((h) => new Date(h.timestamp).toDateString()));
+    let streak = 0;
+    const cursor = new Date();
+    // Allow the streak to start yesterday if nothing was read today yet.
+    if (!days.has(cursor.toDateString())) cursor.setDate(cursor.getDate() - 1);
+    while (days.has(cursor.toDateString())) {
+      streak += 1;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+    return { chapters, pages, top, streak, series: new Set(history.map((h) => h.mangaName)).size };
+  }, [history]);
+
   const canGroupByVolume = volumes.length > 1;
+
+  // Highest chapter number recorded as read for the open series. A chapter at or
+  // below this gets a tick; the first chapter above it is "next unread".
+  const readMax = readMap[currentSeriesKey] || 0;
+
+  // Chapter-list filter. Matches the chapter label so "12" finds "Chapter 120".
+  const filteredChapters = useMemo(() => {
+    const q = chapterFilter.trim().toLowerCase();
+    if (!q) return chapters;
+    return chapters.filter((ch) => (ch.title || `Chapter ${ch.num}`).toLowerCase().includes(q));
+  }, [chapters, chapterFilter]);
+
+  // The lowest chapter above the read mark, which is where a returning reader
+  // wants to resume. Chapters are sorted newest-first, so this is a scan.
+  const nextUnread = useMemo(() => {
+    let best: ChapterItem | null = null;
+    for (const ch of chapters) {
+      if (ch.num <= readMax) continue;
+      if (!best || ch.num < best.num) best = ch;
+    }
+    return best;
+  }, [chapters, readMax]);
+
+  // Jump to a chapter by number, snapping to the nearest if it does not exist
+  // (the numbering has gaps and .5 side chapters).
+  const jumpToChapter = (n: number) => {
+    if (!isFinite(n) || !chapters.length) return;
+    let best = chapters[0];
+    for (const ch of chapters) if (Math.abs(ch.num - n) < Math.abs(best.num - n)) best = ch;
+    loadChapter(best.url);
+    setShowChapters(false);
+  };
 
   // Chapters bucketed by volume; unnumbered gaps collect under "Other".
   const volumeGroups = useMemo(() => {
     if (!canGroupByVolume) return [];
     const groups = new Map<string, ChapterItem[]>();
-    for (const ch of chapters) {
+    for (const ch of filteredChapters) {
       const key = ch.volume || "Other";
       const bucket = groups.get(key);
       if (bucket) bucket.push(ch);
@@ -915,7 +1112,7 @@ export default function MangaReader() {
     const other = groups.get("Other");
     if (other) ordered.push(["Other", other]);
     return ordered;
-  }, [chapters, canGroupByVolume]);
+  }, [filteredChapters, canGroupByVolume]);
 
   const bg = isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]";
   const textCol = isDark ? "text-white" : "text-gray-900";
@@ -1020,6 +1217,41 @@ export default function MangaReader() {
           ))}
         </div>
       </SidePanel>
+
+      {/* Reading stats. Derived entirely from history, so there is nothing extra
+          to persist and nothing to keep in sync. */}
+      <SidePanel title="Reading Stats" icon={<BarChart3 className="h-4 w-4" />} show={showStats} onClose={() => setShowStats(false)}>
+        <div className="p-4 space-y-4">
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              ["Chapters", stats.chapters],
+              ["Pages", stats.pages],
+              ["Day streak", stats.streak],
+            ].map(([label, value]) => (
+              <div key={label} className={`rounded-lg border p-3 text-center ${isDark ? "border-white/10 bg-white/[0.03]" : "border-gray-200 bg-white"}`}>
+                <div className="text-lg font-semibold">{value}</div>
+                <div className={`text-[10px] uppercase tracking-wider ${subText}`}>{label}</div>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div className={`text-xs uppercase tracking-wider mb-2 ${subText}`}>Series read ({stats.series})</div>
+            <div className="space-y-1">
+              {stats.top.length === 0 && <p className={`text-sm ${subText}`}>No reading history yet.</p>}
+              {stats.top.map(([host, count]) => (
+                <div key={host} className="flex items-center justify-between text-sm">
+                  <span className={`truncate ${isDark ? "text-white/80" : "text-gray-700"}`}>{host}</span>
+                  <span className={subText}>{count}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <button onClick={() => { clearAll(); setHistory([]); setReadingList([]); setReadMap({}); setBanner({ kind: "info", text: "All saved data cleared." }); }}
+            className={`w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${isDark ? "border-red-900/60 text-red-300 hover:bg-red-950/30" : "border-red-200 text-red-700 hover:bg-red-50"}`}>
+            <Trash2 className="h-4 w-4" /> Clear history &amp; saved data
+          </button>
+        </div>
+      </SidePanel>
     </>
   );
 
@@ -1066,6 +1298,7 @@ export default function MangaReader() {
             <button onClick={() => setShowSearch(true)} aria-label="Search manga" className={`p-2 rounded ${subText} ${hoverBg}`} title="Search manga"><Search className="h-5 w-5" /></button>
             <button onClick={() => setShowHistory(true)} aria-label="Reading history" className={`p-2 rounded ${subText} ${hoverBg}`} title="History"><History className="h-5 w-5" /></button>
             <button onClick={() => setShowSaved(true)} aria-label="Reading list" className={`p-2 rounded ${subText} ${hoverBg}`} title="Reading list"><Bookmark className="h-5 w-5" /></button>
+            <button onClick={() => setShowStats(true)} aria-label="Reading stats" className={`p-2 rounded ${subText} ${hoverBg}`} title="Reading stats"><BarChart3 className="h-5 w-5" /></button>
             <button onClick={toggleTheme} aria-label="Toggle colour theme" className={`p-2 rounded ${subText} ${hoverBg}`} title="Toggle theme">
               {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </button>
@@ -1175,6 +1408,25 @@ export default function MangaReader() {
                     <option key={s.id} value={s.id}>{s.name}</option>
                   ))}
                 </select>
+                {/* Sort and placeholder filter apply to the full catalogue, which
+                    is where ~1200 titles make ordering matter. */}
+                {scope === "all" && (
+                  <>
+                    <select value={sortKey} onChange={(e) => setSortKey(e.target.value as SortKey)}
+                      aria-label="Sort titles"
+                      className={`text-sm rounded-md border px-2 py-1.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "bg-white/5 border-white/10 text-white/80 focus-visible:outline-white/60" : "bg-white border-gray-200 text-gray-700 focus-visible:outline-gray-500"}`}>
+                      <option value="shelf">Default order</option>
+                      <option value="title">Title A–Z</option>
+                      <option value="chapters">Most chapters</option>
+                      <option value="latest">Latest chapter</option>
+                    </select>
+                    <button onClick={() => setHideEmpty((v) => !v)} aria-pressed={hideEmpty}
+                      title="Hide titles whose listing is empty or a placeholder"
+                      className={`px-2 py-1.5 rounded text-xs border transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${hideEmpty ? (isDark ? "bg-white/15 border-white/20 text-white" : "bg-gray-200 border-gray-300 text-gray-900") : `${isDark ? "border-white/10 text-white/70" : "border-gray-200 text-gray-600"}`}`}>
+                      Hide placeholders
+                    </button>
+                  </>
+                )}
               </div>
             </div>
 
@@ -1215,10 +1467,12 @@ export default function MangaReader() {
             )}
 
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
-              {!titlesLoading && visibleTitles.map((t) => (
+              {!titlesLoading && visibleTitles.map((t) => {
+                const progress = progressBySeries.get(t.title.toLowerCase());
+                return (
                 <button key={`${t.sourceId}:${t.url}`} onClick={() => openTitle(t)}
                   disabled={openingTitle === t.title}
-                  aria-label={`Open ${t.title} from ${t.sourceName}`}
+                  aria-label={`Open ${t.title} from ${t.sourceName}${progress ? `, last read chapter ${progress.chapterNum}` : ""}`}
                   className={`group relative text-left rounded-xl overflow-hidden border transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-60 ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03] focus-visible:outline-white/60" : "border-gray-200 hover:border-gray-300 bg-white focus-visible:outline-gray-500"}`}>
                   <div className={`relative w-full overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
                     {t.thumbnail ? (
@@ -1227,6 +1481,13 @@ export default function MangaReader() {
                     ) : (
                       <div className={`w-full h-full flex items-center justify-center ${subText}`}>
                         <BookOpen className="h-8 w-8" />
+                      </div>
+                    )}
+                    {/* Reading-progress badge: where the reader left off. */}
+                    {progress && (
+                      <div className="absolute top-1.5 left-1.5 flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-black/70 text-white backdrop-blur-sm">
+                        <BookOpen className="h-2.5 w-2.5" />
+                        Ch {progress.chapterNum}{progress.page ? ` · p${progress.page}` : ""}
                       </div>
                     )}
                     {openingTitle === t.title && (
@@ -1244,7 +1505,8 @@ export default function MangaReader() {
                     </div>
                   </div>
                 </button>
-              ))}
+                );
+              })}
             </div>
 
             {/* Paging for the full catalogue. */}
@@ -1313,6 +1575,14 @@ export default function MangaReader() {
             {savedHere ? <BookmarkCheck className="h-4 w-4" /> : <BookmarkPlus className="h-4 w-4" />}
           </button>
           <button onClick={() => setShowSaved(true)} aria-label="Open reading list" className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Reading list"><Bookmark className="h-4 w-4" /></button>
+          {/* Whole-chapter prefetch, for reading a chapter offline on a weak link. */}
+          <button onClick={prefetchWholeChapter} disabled={!!prefetchProgress}
+            aria-label={prefetchProgress ? `Caching pages, ${prefetchProgress.done} of ${prefetchProgress.total}` : "Prefetch this chapter for offline reading"}
+            className={`px-2 py-1 rounded text-xs transition-colors disabled:opacity-60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Prefetch chapter (offline)">
+            {prefetchProgress
+              ? <><Loader2 className="h-3.5 w-3.5 inline mr-1 animate-spin" />{prefetchProgress.done}/{prefetchProgress.total}</>
+              : <><Download className="h-3.5 w-3.5 inline mr-1" />Cache</>}
+          </button>
           <button onClick={() => setShowChapters((v) => !v)} className={`px-2 py-1 rounded text-xs transition-colors ${showChapters ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${subText} ${hoverBg}`} title="Chapter list (L)"><List className="h-3.5 w-3.5 inline mr-1" />Chapters</button>
           <div className={`w-px h-4 mx-1 ${isDark ? "bg-white/10" : "bg-gray-200"}`} />
           {(["width", "height", "original"] as const).map((fm) => (
@@ -1355,6 +1625,12 @@ export default function MangaReader() {
           </button>
           <button onClick={() => { setShowSaved(true); setShowMobileMenu(false); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
             <Bookmark className="h-3.5 w-3.5 inline mr-1" />Reading list
+          </button>
+          <button onClick={() => { prefetchWholeChapter(); setShowMobileMenu(false); }} disabled={!!prefetchProgress} className={`px-3 py-2 rounded text-xs disabled:opacity-60 ${hoverBg}`}>
+            <Download className="h-3.5 w-3.5 inline mr-1" />{prefetchProgress ? `Caching ${prefetchProgress.done}/${prefetchProgress.total}` : "Cache chapter"}
+          </button>
+          <button onClick={() => { setShowStats(true); setShowMobileMenu(false); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
+            <BarChart3 className="h-3.5 w-3.5 inline mr-1" />Stats
           </button>
           <button onClick={() => { toggleWide(); setShowMobileMenu(false); }} aria-pressed={wide} className={`px-3 py-2 rounded text-xs ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
             <Columns2 className="h-3.5 w-3.5 inline mr-1" />Two-page
@@ -1399,6 +1675,31 @@ export default function MangaReader() {
           {chaptersLoading && <div className="flex justify-center py-8"><Loader2 className="h-5 w-5 animate-spin" /></div>}
           {chapters.length === 0 && !chaptersLoading && <p className={`text-sm text-center py-8 ${subText}`}>Load a chapter first to see the list</p>}
 
+          {chapters.length > 0 && (
+            <>
+              {/* Filter and jump-to-number, so a 200+ chapter series is navigable. */}
+              <div className="flex gap-2 mb-2">
+                <Input placeholder="Filter chapters…" value={chapterFilter} onChange={(e) => setChapterFilter(e.target.value)}
+                  aria-label="Filter chapters"
+                  className={`h-9 text-sm ${isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-gray-50 border-gray-200 text-gray-900"}`} />
+                <div className="flex gap-1">
+                  <input type="number" inputMode="decimal" value={chapterJump} onChange={(e) => setChapterJump(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { const n = parseFloat(chapterJump); jumpToChapter(n); } }}
+                    placeholder="Ch #" aria-label="Jump to chapter number"
+                    className={`w-16 px-2 h-9 rounded-md text-sm border ${isDark ? "bg-white/5 border-white/10 text-white" : "bg-white border-gray-200 text-gray-900"}`} />
+                  <Button size="sm" onClick={() => jumpToChapter(parseFloat(chapterJump))} disabled={!chapterJump}>Go</Button>
+                </div>
+              </div>
+              {nextUnread && (
+                <button onClick={() => { loadChapter(nextUnread.url); setShowChapters(false); }}
+                  className={`w-full mb-2 px-3 py-2 rounded-lg text-sm text-left border ${isDark ? "border-white/15 hover:border-white/30 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
+                  <ArrowDownUp className="h-3.5 w-3.5 inline mr-1.5" />
+                  Next unread: {nextUnread.title || `Chapter ${nextUnread.num}`}
+                </button>
+              )}
+            </>
+          )}
+
           {canGroupByVolume && (
             <div className={`flex items-center gap-1 mb-2 p-0.5 rounded-lg ${isDark ? "bg-white/5" : "bg-gray-100"}`}>
               {(["chapter", "volume"] as GroupMode[]).map((m) => (
@@ -1414,15 +1715,23 @@ export default function MangaReader() {
 
           {groupMode === "chapter" || !canGroupByVolume ? (
             <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
-              {chapters.map((ch) => {
+              {filteredChapters.length === 0 && (
+                <p className={`text-sm text-center py-6 ${subText}`}>No chapters match “{chapterFilter.trim()}”.</p>
+              )}
+              {filteredChapters.map((ch) => {
                 const isCurrent = ch.num === Number(data.chapterNum);
+                const isRead = ch.num <= readMax;
                 return (
                   <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
-                    className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
+                    className={`w-full flex items-center gap-2 text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
                       ? (isDark ? "bg-white/15" : "bg-gray-200") + " font-semibold"
                       : hoverBg
                     } ${isCurrent ? textCol : subText}`}>
-                    {ch.title || `Chapter ${ch.num}`}
+                    {/* Read tick. Reserve the slot so labels stay aligned. */}
+                    <span className="w-3.5 shrink-0" aria-hidden="true">
+                      {isRead && !isCurrent && <Check className="h-3.5 w-3.5" />}
+                    </span>
+                    <span className="flex-1 min-w-0 truncate">{ch.title || `Chapter ${ch.num}`}</span>
                   </button>
                 );
               })}
@@ -1438,13 +1747,17 @@ export default function MangaReader() {
                   <div className="mt-0.5 space-y-0.5">
                     {items.map((ch) => {
                       const isCurrent = ch.num === Number(data.chapterNum);
+                      const isRead = ch.num <= readMax;
                       return (
                         <button key={ch.url} onClick={() => { loadChapter(ch.url); setShowChapters(false); }}
-                          className={`w-full text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
+                          className={`w-full flex items-center gap-2 text-left px-3 py-1.5 rounded text-sm transition-colors ${isCurrent
                             ? (isDark ? "bg-white/15" : "bg-gray-200") + " font-semibold"
                             : hoverBg
                           } ${isCurrent ? textCol : subText}`}>
-                          {ch.title || `Chapter ${ch.num}`}
+                          <span className="w-3.5 shrink-0" aria-hidden="true">
+                            {isRead && !isCurrent && <Check className="h-3.5 w-3.5" />}
+                          </span>
+                          <span className="flex-1 min-w-0 truncate">{ch.title || `Chapter ${ch.num}`}</span>
                         </button>
                       );
                     })}
@@ -1564,6 +1877,10 @@ export default function MangaReader() {
               {paged
                 ? "Click the page to turn it; at the last page it moves to the next chapter. Turn on RTL for right-to-left manga."
                 : "Click the page area to scroll down; at the last page it moves to the next chapter. On a touch screen, swipe left or right to change chapter."}
+            </p>
+            <p className={`text-[10px] mt-2 ${subText}`}>
+              RTL, fit and layout are remembered per series. Use the chapter list's filter to
+              jump to a chapter, and “Cache” to prefetch the whole chapter for offline reading.
             </p>
           </div>
         </div>

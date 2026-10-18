@@ -201,4 +201,63 @@ export async function run(): Promise<void> {
     assertEqual(fresh.getFitMode(), "height", "legacy fit mode should be preserved");
     assertEqual(fresh.getWide(), true, "legacy wide flag should be preserved");
   });
+
+  await test("read progress is recorded per series and never goes backwards", async () => {
+    clearCookies();
+    const fresh = await freshStorage("read-progress");
+    fresh.markRead("specterscans:boku-no-kokoro-no-yabai-yatsu", 12);
+    assertEqual(fresh.getRead()["specterscans:boku-no-kokoro-no-yabai-yatsu"], 12, "chapter 12 should be recorded");
+    // Re-reading an earlier chapter must not lower the mark.
+    fresh.markRead("specterscans:boku-no-kokoro-no-yabai-yatsu", 4);
+    assertEqual(fresh.getRead()["specterscans:boku-no-kokoro-no-yabai-yatsu"], 12, "the mark must not regress");
+    fresh.markRead("specterscans:boku-no-kokoro-no-yabai-yatsu", 20);
+    assertEqual(fresh.getRead()["specterscans:boku-no-kokoro-no-yabai-yatsu"], 20, "a later chapter should raise the mark");
+  });
+
+  await test("read progress survives a reload", async () => {
+    const fresh = await freshStorage("read-reload");
+    assertEqual(fresh.getRead()["specterscans:boku-no-kokoro-no-yabai-yatsu"], 20, "read progress should survive a reload");
+  });
+
+  await test("per-series reader defaults round-trip", async () => {
+    clearCookies();
+    const fresh = await freshStorage("series-prefs");
+    fresh.setSeriesPrefs("ffb:the-fragrant-flower-blooms-with-dignity", { rtl: true, fitMode: "height" });
+    const prefs = fresh.getSeriesPrefs("ffb:the-fragrant-flower-blooms-with-dignity");
+    assertEqual(prefs.rtl, true, "rtl should persist per series");
+    assertEqual(prefs.fitMode, "height", "fit mode should persist per series");
+    // A patch merges rather than replacing, so setting one field keeps the rest.
+    fresh.setSeriesPrefs("ffb:the-fragrant-flower-blooms-with-dignity", { paged: true });
+    const merged = fresh.getSeriesPrefs("ffb:the-fragrant-flower-blooms-with-dignity");
+    assertEqual(merged.rtl, true, "an existing field should survive a later patch");
+    assertEqual(merged.paged, true, "the new field should be set");
+    const reload = await freshStorage("series-prefs-reload");
+    assertEqual(reload.getSeriesPrefs("ffb:the-fragrant-flower-blooms-with-dignity").rtl, true, "series prefs should survive a reload");
+  });
+
+  await test("the read map and series prefs stay inside the cookie limit", () => {
+    clearCookies();
+    const s = (globalThis as unknown as { document: { cookie: string } }).document;
+    for (let i = 0; i < 120; i++) {
+      storage.markRead(`src:series-number-${i}`, i + 1);
+      storage.setSeriesPrefs(`src:series-number-${i}`, { rtl: i % 2 === 0, fitMode: "height" });
+    }
+    assert(
+      largestCookie(jar) < COOKIE_LIMIT,
+      `the settings cookie must stay under the limit, largest was ${largestCookie(jar)}`
+    );
+    assert(s.cookie.length > 0, "cookies should still be present");
+  });
+
+  await test("clearAll wipes history, list and progress", async () => {
+    const fresh = await freshStorage("clear-all");
+    fresh.pushHistory(entry(`${FFB}/the-fragrant-flower-blooms-with-dignity-manga-chapter-1/`, "1", LONG_NAME));
+    fresh.markRead("ffb:the-fragrant-flower-blooms-with-dignity", 5);
+    fresh.clearAll();
+    assertEqual(fresh.getHistory().length, 0, "history should be cleared");
+    assertEqual(fresh.getList().length, 0, "the reading list should be cleared");
+    assertEqual(Object.keys(fresh.getRead()).length, 0, "read progress should be cleared");
+    const reload = await freshStorage("clear-all-reload");
+    assertEqual(reload.getHistory().length, 0, "a reload after clearing should stay empty");
+  });
 }

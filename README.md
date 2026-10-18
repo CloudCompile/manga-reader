@@ -21,10 +21,20 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 - Full vertical-scroll reader with image proxying
 - Dark / Light theme toggle
 - Fit modes: Width, Height, Original
-- Chapter list sidebar (auto-fetched)
-- Search across all sources
+- Chapter list sidebar (auto-fetched) with a filter, jump-to-chapter, read
+  ticks, and a "next unread" shortcut
+- Per-series reader defaults: RTL, fit mode, layout and two-page spread are
+  remembered for each title
+- Reading-progress badges on the shelf, showing the last chapter and page
+- Reading stats (chapters, pages, day streak, top sources) and one-tap clear
+- Search across all sources, including alternate and romanised titles
+- Catalogue sorting (title, chapter count, latest chapter) and a filter that
+  hides empty placeholder entries
 - Reading history
 - Page jumper with keyboard shortcuts
+- Whole-chapter prefetch ("Cache") for offline reading
+- Installable PWA: manifest, home-screen icon, and a service worker that keeps
+  an offline app shell and caches pages already read
 - Mobile responsive
 - Storage works on constrained browsers: state is kept in a `Secure` cookie
   with an in-memory fallback, so it never depends on `localStorage`,
@@ -32,10 +42,43 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 
 ## Storage
 
-Reading history, the last-read chapter, and the theme choice are persisted in a
-single `Secure; SameSite=Lax` cookie. Browsers and Android WebView builds that
-block cookies or lack `localStorage` / `IndexedDB` still work: the reader falls
-back to in-memory state for the current session instead of throwing.
+Reading history, the last-read chapter, the theme choice, per-series reader
+defaults, and per-series read progress are persisted in `Secure; SameSite=Lax`
+cookies. Browsers and Android WebView builds that block cookies or lack
+`localStorage` / `IndexedDB` still work: the reader falls back to in-memory
+state for the current session instead of throwing. Every cookie is capped so it
+stays inside the ~4 KB browser limit.
+
+## API
+
+The current routes live under `/api`; versioned aliases live under `/api/v1`
+and behave identically. The versioned paths are the stable surface to build
+against.
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/api/scrape` | POST | Scrape a chapter's pages (`{ url }`) |
+| `/api/chapters` | POST | List a series' chapters (`{ url }`) |
+| `/api/search` | GET | Search every source (`?q=`) |
+| `/api/titles` | GET | Shelf by default; `?all=1` pages the full catalogue (`offset`, `source`, `q`, `sort`, `hideEmpty`) |
+| `/api/proxy` | GET | Stream a page image (`?url=`); exempt from rate limiting |
+
+Scrape, chapter-list and search routes are rate limited per client
+(30 requests/minute, 60 for chapter lists) and return `429` with `Retry-After`
+when over budget. Image proxying is deliberately not limited, since one chapter
+view legitimately fetches dozens of images.
+
+## OPDS
+
+An [OPDS](https://opds.io/) catalogue is served for external reader apps:
+
+| Feed | URL |
+|------|-----|
+| Navigation | `/opds` |
+| Shelf | `/opds/shelf` |
+| Full catalogue | `/opds/all` (paged, 100 per page) |
+| Search | `/opds/search?q=` |
+
 
 ## Deploy to Vercel
 
@@ -57,5 +100,21 @@ Open [http://localhost:3000](http://localhost:3000).
 | `←` `→` | Previous / Next chapter |
 | `T` | Toggle theme |
 | `L` | Toggle chapter list |
+| `S` | Save to reading list |
+| `W` | Two-page spread |
+| `F` | Fullscreen |
 | `G` | Jump to page |
+| `?` | Shortcut help |
 | `Esc` | Close panels |
+
+## Tests
+
+```bash
+npm test        # storage, sources, cache, rate limiter, OPDS, catalogue order
+npm run typecheck
+```
+
+## Notes for contributors
+
+See [AGENTS.md](./AGENTS.md) for the architecture, the site-specific scraper
+quirks, and the release process.
