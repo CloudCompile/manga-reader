@@ -18,7 +18,8 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 
 ## Features
 
-- Full vertical-scroll reader with image proxying
+- Full vertical-scroll reader; page images load directly from the publishing
+  host, with an automatic proxy fallback for hosts that block it
 - Dark / Light theme toggle
 - Fit modes: Width, Height, Original
 - Chapter list sidebar (auto-fetched) with a filter, jump-to-chapter, read
@@ -35,6 +36,7 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 - Whole-chapter prefetch ("Cache") for offline reading
 - Installable PWA: manifest, home-screen icon, and a service worker that keeps
   an offline app shell and caches pages already read
+- Legal pages: `/terms`, `/privacy`, and `/disclaimer`, linked from the footer
 - Mobile responsive
 - Storage works on constrained browsers: state is kept in a `Secure` cookie
   with an in-memory fallback, so it never depends on `localStorage`,
@@ -67,6 +69,31 @@ Scrape, chapter-list and search routes are rate limited per client
 (30 requests/minute, 60 for chapter lists) and return `429` with `Retry-After`
 when over budget. Image proxying is deliberately not limited, since one chapter
 view legitimately fetches dozens of images.
+
+### Images and the proxy
+
+Page images are loaded by the browser **directly from the publishing host**.
+Every supported image host was checked and serves its pages with no `Referer`
+check and no CORS requirement, so a direct load works and avoids a double hop
+through this server. That is also the honest architecture: the reader links to
+material rather than retransmitting it.
+
+`/api/proxy` still exists and is used automatically when a direct load fails —
+a host that later adds a hotlink or CORS restriction. The `<img>` `onError`
+handler retries that image through the proxy and remembers the host for the
+rest of the session. The proxy fetches and forwards the image; it is not a
+content store.
+
+Set `DIRECT_IMAGES = false` in `src/app/page.tsx` to route every image through
+the proxy instead, which is the previous behaviour.
+
+## Legal
+
+This is an unofficial reader. It hosts no manga; it indexes third-party sites
+and loads the images those sites publish. See [`LICENSE`](LICENSE) (MIT, code
+only), [`DISCLAIMER.md`](DISCLAIMER.md), and the `/terms`, `/privacy`, and
+`/disclaimer` pages for the full statements. Takedown and other legal contact:
+christopher.j.hauser2025@outlook.com.
 
 ## OPDS
 

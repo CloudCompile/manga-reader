@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import type { SyntheticEvent } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -134,6 +136,67 @@ type SortKey = "shelf" | "title" | "chapters" | "latest";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
+// Direct image loading.
+//
+// Every supported image host was probed and serves its pages with no Referer
+// check and no CORS requirement, so the browser can load a page straight from
+// the host that publishes it. That is both faster (no double hop through this
+// server) and the honest architecture: the service links to material rather
+// than retransmitting it.
+//
+// Two things still need the proxy, and both fall back to it automatically:
+//   1. Hosts that later add a hotlink or CORS restriction. The first direct
+//      load fails, so the image is retried through the proxy and the host is
+//      remembered for the rest of the session.
+//   2. Formats a browser can decode but `fetch` refuses to hand to JS. That
+//      only matters for the prefetch path, which must read bytes to fill the
+//      cache; the <img> path is unaffected.
+//
+// When DIRECT_IMAGES is off, every image goes through the proxy, which is the
+// old behaviour.
+const DIRECT_IMAGES = true;
+
+// Hosts that rejected a direct load this session. Cleared on reload.
+const DIRECT_BLOCKED = new Set<string>();
+
+function hostOf(src: string): string {
+  try {
+    return new URL(src).host;
+  } catch {
+    return "";
+  }
+}
+
+// The URL an <img> should start with.
+function imageSrc(src: string): string {
+  if (!DIRECT_IMAGES) return PROXY(src);
+  const host = hostOf(src);
+  if (host && DIRECT_BLOCKED.has(host)) return PROXY(src);
+  return src;
+}
+
+// Called when a direct load fails. Marks the host as blocked and returns the
+// proxied URL to retry with, or null if there is nothing to retry.
+function proxyFallback(src: string): string | null {
+  if (!DIRECT_IMAGES) return null;
+  if (src.startsWith("/api/proxy")) return null;
+  const host = hostOf(src);
+  if (host) DIRECT_BLOCKED.add(host);
+  return PROXY(src);
+}
+
+// <img> onError handler. A direct load that fails is retried once through the
+// proxy; if the proxy URL is what just failed, give up instead of looping.
+function handleImageError(
+  e: SyntheticEvent<HTMLImageElement>,
+  src: string
+): void {
+  const el = e.currentTarget;
+  if (el.src.includes("/api/proxy?")) return;
+  const fallback = proxyFallback(src);
+  if (fallback) el.src = fallback;
+}
+
 // Chapter payloads fetched ahead of time, keyed by chapter URL. Session-only:
 // this is a latency optimisation, not storage, so it is deliberately not
 // persisted and is dropped when the tab goes away.
@@ -170,7 +233,7 @@ function warmPages(chapterUrl: string, images: string[]) {
   for (const src of images.slice(0, WARM_PAGES)) {
     const img = new Image();
     img.decoding = "async";
-    img.src = PROXY(src);
+    img.src = imageSrc(src);
   }
 }
 
@@ -208,7 +271,7 @@ function warmLookahead(images: string[], fromIndex: number) {
     }
     const img = new Image();
     img.decoding = "async";
-    img.src = PROXY(src);
+    img.src = imageSrc(src);
   }
   WARMED_PER_CHAPTER.set(images, warmed);
 }
@@ -230,13 +293,28 @@ async function prefetchChapterPages(
   let done = 0;
   for (const src of images) {
     try {
-      await new Promise<void>((resolve) => {
-        const img = new Image();
-        img.decoding = "async";
-        img.onload = () => resolve();
-        img.onerror = () => resolve();
-        img.src = PROXY(src);
-      });
+      // Read the bytes directly when the host allows it, so the HTTP cache is
+      // filled without another server round trip. If the direct read is refused
+      // (a host that later adds CORS, or a format fetch will not hand over),
+      // fall back to the proxy, which is what serves the browser too.
+      let ok = false;
+      try {
+        const resp = await fetch(imageSrc(src), { cache: "force-cache", mode: "cors" });
+        ok = resp.ok;
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        const fallback = proxyFallback(src);
+        if (fallback) {
+          try {
+            const resp = await fetch(fallback, { cache: "force-cache" });
+            ok = resp.ok;
+          } catch {
+            ok = false;
+          }
+        }
+      }
     } catch {
       /* one failed page must not stop the rest */
     }
@@ -945,7 +1023,7 @@ export default function MangaReader() {
   };
 
   const totalPages = data?.images.length || 0;
-  const displayImages = data ? data.images.map(PROXY) : [];
+  const displayImages = data ? data.images.map(imageSrc) : [];
   const isDark = theme === "dark";
 
   // Paged mode shows one page per screen. Turning past the last page moves to
@@ -1476,7 +1554,8 @@ export default function MangaReader() {
                   className={`group relative text-left rounded-xl overflow-hidden border transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-60 ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03] focus-visible:outline-white/60" : "border-gray-200 hover:border-gray-300 bg-white focus-visible:outline-gray-500"}`}>
                   <div className={`relative w-full overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
                     {t.thumbnail ? (
-                      <img src={PROXY(t.thumbnail)} alt="" loading="lazy"
+                      <img src={imageSrc(t.thumbnail)} alt="" loading="lazy"
+                        onError={(e) => handleImageError(e, t.thumbnail!)}
                         className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]" />
                     ) : (
                       <div className={`w-full h-full flex items-center justify-center ${subText}`}>
@@ -1522,6 +1601,16 @@ export default function MangaReader() {
           {/* Keyboard shortcuts hint */}
           <div className={`text-xs ${subText} text-center space-y-1 pb-6`}>
             <p>Keyboard shortcuts: <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>←</kbd> <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>→</kbd> chapters · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>T</kbd> theme · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>L</kbd> chapter list · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>S</kbd> save · <kbd className={`px-1 py-0.5 rounded text-[10px] ${isDark ? "bg-white/10" : "bg-gray-200"}`}>?</kbd> all</p>
+            {/* The reader indexes third-party sites and hosts nothing, so the
+                disclaimer is one click from the home page rather than buried. */}
+            <p className={`pt-2 ${isDark ? "text-white/35" : "text-gray-400"}`}>
+              Independent, unofficial reader. Not affiliated with any publisher or site.
+            </p>
+            <p className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
+              <Link href="/disclaimer" className="hover:underline">Disclaimer</Link>
+              <Link href="/terms" className="hover:underline">Terms</Link>
+              <Link href="/privacy" className="hover:underline">Privacy</Link>
+            </p>
           </div>
         </main>
 
@@ -1796,6 +1885,7 @@ export default function MangaReader() {
                   )}
                   <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
                     src={displayImages[i]} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
+                    onError={(e) => handleImageError(e, data.images[i])}
                     style={{ ...wideStyle, display: loadedImages.has(i) ? "block" : "none" }}
                     // Paged mode renders only the visible page, so its index can
                     // be any number; it must load eagerly or the lazy heuristic

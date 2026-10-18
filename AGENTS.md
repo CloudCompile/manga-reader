@@ -34,9 +34,17 @@ body rather than skipping the release.
   scrape/list/search/browse API. Fetches try direct first, then fall back to the
   `cors-proxy.christopher-j-hauser2025.workers.dev` worker (`PROXY_BASE`).
 - API routes: `/api/scrape`, `/api/chapters`, `/api/search`, `/api/titles`,
-  `/api/proxy`. The proxy route is what serves chapter images to the browser.
+  `/api/proxy`. Page images load **directly from the publishing host** by
+  default; the proxy is the fallback, not the primary path (see "Images and the
+  proxy" below).
   Versioned aliases for the four data routes live under `/api/v1/*` and must
   stay in step with their `/api` counterparts; they are the stable surface.
+- `src/lib/legal.ts` + `src/app/{terms,privacy,disclaimer}` + `LICENSE` +
+  `DISCLAIMER.md` — the legal surface. `legal.ts` holds the text for all three
+  pages so they cannot drift apart, and `LEGAL_CONTACT` is the single contact
+  address. The reader links them from the landing footer. If the app's actual
+  behaviour changes (for example how images are fetched), the text here must be
+  updated with it: a legal page that misdescribes the app is worse than none.
 - `src/lib/ratelimit.ts` — in-memory fixed-window limiter (`withRateLimit`).
   Applied to scrape, chapters and search. `/api/proxy` is deliberately exempt:
   one chapter view fetches dozens of images, so a per-request cap there would
@@ -113,8 +121,8 @@ AllManga and MangaFragrant are excluded from the shelf
 (`SHELF_EXCLUDED_SOURCES`): AllManga's listing churns, and MangaFragrant's
 recent chapters belong to another series, so the shelf would offer a broken
 copy of a title that ffb already carries in full. Both stay reachable through
-the full catalogue and search. The shelf grid renders covers through
-`/api/proxy` rather than hotlinking the CDN, so a blocked or dead cover degrades
+the full catalogue and search. The shelf grid loads covers directly from the
+CDN, falling back to `/api/proxy` on error, so a blocked or dead cover degrades
 to the placeholder icon instead of a broken image. Spectre Scans' sitemap lists
 a few covers whose filenames contain a colon; the CDN does not serve those, so
 they are dropped at listing time.
@@ -161,16 +169,35 @@ budget and the shelf must not wait on it. Entries that miss the deadline simply
 carry no aliases. `sortTitles` and `titleMatches` live in `sources.ts` (not the
 route) so the Node tests can exercise them without resolving the `@/` alias.
 
+## Images and the proxy
+
+Page images load **directly from the publishing host**. Every supported image
+host was probed and serves pages with no `Referer` check and no CORS
+requirement, so the browser can load them itself, which avoids a double hop and
+means the app links to material instead of retransmitting it. `DIRECT_IMAGES`
+in `src/app/page.tsx` flips the whole app back to proxy-only if a host starts
+refusing direct loads.
+
+`imageSrc` / `proxyFallback` / `handleImageError` implement the fallback: an
+`<img>` starts on the direct URL, and on error is retried once through
+`/api/proxy`, with the host recorded in `DIRECT_BLOCKED` for the session so
+later images from it skip straight to the proxy. `handleImageError` refuses to
+retry a URL that is already a proxy URL, which is what stops an infinite
+`onError` loop when the proxy itself fails. `prefetchChapterPages` does the
+same dance with `fetch` so the HTTP cache is filled directly where possible.
+
 ## PWA / offline
 
 `src/app/manifest.ts` and `public/sw.js` make the app installable. The service
 worker caches the shell (network-first, so a new build is never masked by a
-stale one) and proxied page images (cache-first, bounded to `MAX_IMAGES`). Only
-`image/*` responses are cached, so a 502 error body is never pinned. The
-reader's "Cache" button (`prefetchChapterPages`) deliberately pulls every page of
-the open chapter through the proxy. `ServiceWorkerRegistrar` registers it
-best-effort and swallows every failure, since a browser without service workers
-must keep working.
+stale one) and page images (cache-first, bounded to `MAX_IMAGES`). It caches
+both the proxied responses and the direct cross-origin image responses
+(`destination === "image"` and a foreign origin), so offline reading still works
+now that images come straight from the host. Only `image/*` responses are
+cached, so a 502 error body is never pinned. The reader's "Cache" button
+(`prefetchChapterPages`) deliberately pulls every page of the open chapter.
+`ServiceWorkerRegistrar` registers it best-effort and swallows every failure,
+since a browser without service workers must keep working.
 
 ## Reader and theming
 

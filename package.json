@@ -2,6 +2,7 @@
   "name": "manga-reader",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "next dev -p 12000",
     "build": "next build",
