@@ -137,9 +137,22 @@ export async function run(): Promise<void> {
     storage.setTheme("light");
     storage.setFitMode("original");
     storage.setWide(true);
+    storage.setPaged(true);
+    storage.setRtl(true);
     assertEqual(storage.getTheme(), "light", "theme should persist");
     assertEqual(storage.getFitMode(), "original", "fit mode should persist");
     assertEqual(storage.getWide(), true, "wide should persist");
+    assertEqual(storage.getPaged(), true, "paged should persist");
+    assertEqual(storage.getRtl(), true, "rtl should persist");
+  });
+
+  await test("a reload keeps the paged and rtl flags", async () => {
+    // The settings live in their own cookie, so a fresh module reading only
+    // that cookie must still see them; this is the reload path the reader
+    // takes on every launch.
+    const fresh = await freshStorage("prefs-reload");
+    assertEqual(fresh.getPaged(), true, "paged should survive a reload");
+    assertEqual(fresh.getRtl(), true, "rtl should survive a reload");
   });
 
   await test("a corrupt cookie falls back to defaults instead of throwing", async () => {
