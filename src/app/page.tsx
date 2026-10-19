@@ -167,6 +167,51 @@ type SortKey = "shelf" | "title" | "chapters" | "latest";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
+// Shared theme tokens, defined once so the panels (which live at module scope)
+// and the reader agree. Every surface needs both branches: a hardcoded
+// text-white disappears in light mode.
+function panelTokens(isDark: boolean) {
+  return {
+    bg: isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]",
+    textCol: isDark ? "text-white" : "text-gray-900",
+    subText: isDark ? "text-white/50" : "text-gray-500",
+    barBg: isDark ? "bg-[#111] border-white/10" : "bg-white border-gray-200",
+    panelBg: isDark ? "bg-[#111]" : "bg-white",
+    hoverBg: isDark ? "hover:bg-white/10" : "hover:bg-gray-100",
+  };
+}
+
+// A right-hand sheet layered over the current view. Defined at module scope on
+// purpose: a component declared inside MangaReader is a new type on every
+// render, so React would unmount and remount this subtree on each keystroke,
+// which drops focus and closes the mobile keyboard after one character.
+function SidePanel({ title, icon, show, onClose, isDark, children }: {
+  title: string;
+  icon: React.ReactNode;
+  show: boolean;
+  onClose: () => void;
+  isDark: boolean;
+  children: React.ReactNode;
+}) {
+  if (!show) return null;
+  const { panelBg, textCol, hoverBg } = panelTokens(isDark);
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/50" />
+      <div className={`relative w-full max-w-sm ${panelBg} ${textCol} shadow-2xl flex flex-col`} style={{ animation: "slideIn 200ms ease-out" }} onClick={(e) => e.stopPropagation()}>
+        <div className={`flex items-center justify-between px-4 py-3 border-b ${isDark ? "border-white/10" : "border-gray-200"}`}>
+          <div className="flex items-center gap-2">
+            {icon}
+            <h2 className="font-semibold text-sm">{title}</h2>
+          </div>
+          <button onClick={onClose} aria-label="Close panel" className={`p-2 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${hoverBg}`}><X className="h-4 w-4" /></button>
+        </div>
+        <ScrollArea className="flex-1">{children}</ScrollArea>
+      </div>
+    </div>
+  );
+}
+
 // Chapter payloads fetched ahead of time, keyed by chapter URL. Session-only:
 // this is a latency optimisation, not storage, so it is deliberately not
 // persisted and is dropped when the tab goes away.
@@ -1274,12 +1319,7 @@ export default function MangaReader() {
     return ordered;
   }, [filteredChapters, canGroupByVolume]);
 
-  const bg = isDark ? "bg-[#0a0a0a]" : "bg-[#f5f5f5]";
-  const textCol = isDark ? "text-white" : "text-gray-900";
-  const subText = isDark ? "text-white/50" : "text-gray-500";
-  const barBg = isDark ? "bg-[#111] border-white/10" : "bg-white border-gray-200";
-  const panelBg = isDark ? "bg-[#111]" : "bg-white";
-  const hoverBg = isDark ? "hover:bg-white/10" : "hover:bg-gray-100";
+  const { bg, textCol, subText, barBg, panelBg, hoverBg } = panelTokens(isDark);
 
   const imgStyle: React.CSSProperties =
     fitMode === "width" ? { width: "100%", height: "auto" }
@@ -1314,28 +1354,6 @@ export default function MangaReader() {
       ? pageGroups[pagedGroupIndex >= 0 ? pagedGroupIndex : 0]
       : null;
 
-  // ─── Sidebar panel component ─────────────────────
-  const SidePanel = ({ title, icon, show, onClose, children }: {
-    title: string; icon: React.ReactNode; show: boolean; onClose: () => void; children: React.ReactNode;
-  }) => {
-    if (!show) return null;
-    return (
-      <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-        <div className="absolute inset-0 bg-black/50" />
-        <div className={`relative w-full max-w-sm ${panelBg} ${textCol} shadow-2xl flex flex-col`} style={{animation: "slideIn 200ms ease-out"}} onClick={(e) => e.stopPropagation()}>
-          <div className={`flex items-center justify-between px-4 py-3 border-b ${isDark ? "border-white/10" : "border-gray-200"}`}>
-            <div className="flex items-center gap-2">
-              {icon}
-              <h2 className="font-semibold text-sm">{title}</h2>
-            </div>
-            <button onClick={onClose} aria-label="Close panel" className={`p-2 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${hoverBg}`}><X className="h-4 w-4" /></button>
-          </div>
-          <ScrollArea className="flex-1">{children}</ScrollArea>
-        </div>
-      </div>
-    );
-  };
-
   // ─── Banner ────────────────────────────────────────
   // A dismissible message layered over the current view rather than replacing
   // it, so a failed action never costs the reader their place.
@@ -1343,7 +1361,7 @@ export default function MangaReader() {
   // and the reader, so they are defined once and rendered in both views.
   const LibraryPanelsView = (
     <>
-      <SidePanel title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
+      <SidePanel isDark={isDark} title="Reading History" icon={<History className="h-4 w-4" />} show={showHistory} onClose={() => setShowHistory(false)}>
         <div className="p-4 space-y-1">
           {history.length === 0 && <p className={`text-sm ${subText}`}>No history yet</p>}
           {history.map((h) => (
@@ -1358,7 +1376,7 @@ export default function MangaReader() {
         </div>
       </SidePanel>
 
-      <SidePanel title="Reading List" icon={<Bookmark className="h-4 w-4" />} show={showSaved} onClose={() => setShowSaved(false)}>
+      <SidePanel isDark={isDark} title="Reading List" icon={<Bookmark className="h-4 w-4" />} show={showSaved} onClose={() => setShowSaved(false)}>
         <div className="p-4 space-y-1">
           {readingList.length === 0 && (
             <p className={`text-sm ${subText}`}>Nothing saved yet. Open a chapter and tap the bookmark to keep it here.</p>
@@ -1380,7 +1398,7 @@ export default function MangaReader() {
 
       {/* Reading stats. Derived entirely from history, so there is nothing extra
           to persist and nothing to keep in sync. */}
-      <SidePanel title="Reading Stats" icon={<BarChart3 className="h-4 w-4" />} show={showStats} onClose={() => setShowStats(false)}>
+      <SidePanel isDark={isDark} title="Reading Stats" icon={<BarChart3 className="h-4 w-4" />} show={showStats} onClose={() => setShowStats(false)}>
         <div className="p-4 space-y-4">
           <div className="grid grid-cols-3 gap-3">
             {[
@@ -1419,7 +1437,7 @@ export default function MangaReader() {
   // Defined once and rendered in both the landing and reader views, like the
   // library panels, so "watch the anime" is reachable from either.
   const DetailsPanelView = (
-    <SidePanel title="Manga details" icon={<Info className="h-4 w-4" />} show={showDetails} onClose={() => setShowDetails(false)}>
+    <SidePanel isDark={isDark} title="Manga details" icon={<Info className="h-4 w-4" />} show={showDetails} onClose={() => setShowDetails(false)}>
       <div className="p-4 space-y-4">
         <div className="flex gap-4">
           <div className={`w-24 shrink-0 rounded-lg overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
@@ -1480,7 +1498,7 @@ export default function MangaReader() {
   );
 
   const AnimePanelView = (
-    <SidePanel title="Watch the anime" icon={<Tv className="h-4 w-4" />} show={showAnime} onClose={() => setShowAnime(false)}>
+    <SidePanel isDark={isDark} title="Watch the anime" icon={<Tv className="h-4 w-4" />} show={showAnime} onClose={() => setShowAnime(false)}>
       <div className="p-4 space-y-4">
         <div className="flex gap-2">
           <Input placeholder="Search anime…" value={animeQuery} onChange={(e) => setAnimeQuery(e.target.value)}
@@ -1840,7 +1858,7 @@ export default function MangaReader() {
         </main>
 
         {/* Side panels */}
-        <SidePanel title="Search Manga" icon={<Search className="h-4 w-4" />} show={showSearch} onClose={() => setShowSearch(false)}>
+        <SidePanel isDark={isDark} title="Search Manga" icon={<Search className="h-4 w-4" />} show={showSearch} onClose={() => setShowSearch(false)}>
           <div className="p-4 space-y-3">
             <div className="flex gap-2">
               <Input placeholder="Search…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
@@ -1997,7 +2015,7 @@ export default function MangaReader() {
       )}
 
       {/* Chapter sidebar */}
-      <SidePanel title={`Chapters (${chapters.length})`} icon={<List className="h-4 w-4" />} show={showChapters} onClose={() => setShowChapters(false)}>
+      <SidePanel isDark={isDark} title={`Chapters (${chapters.length})`} icon={<List className="h-4 w-4" />} show={showChapters} onClose={() => setShowChapters(false)}>
         <div className="p-3">
           {chaptersLoading && <div className="flex justify-center py-8"><Loader2 className="h-5 w-5 animate-spin" /></div>}
           {chapters.length === 0 && !chaptersLoading && <p className={`text-sm text-center py-8 ${subText}`}>Load a chapter first to see the list</p>}
