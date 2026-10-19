@@ -23,7 +23,9 @@ import {
   List,
   Volume2,
   VolumeX,
+  RotateCw,
 } from "lucide-react";
+import { getAnimeRotate, setAnimeRotate } from "@/lib/storage";
 import type { AnimeEpisode, AnimeServer, AnimeStream } from "@/lib/anime";
 
 const RELAY = (url: string) => `/api/anime/hls?url=${encodeURIComponent(url)}`;
@@ -46,7 +48,12 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
   const [error, setError] = useState("");
   const [showList, setShowList] = useState(false);
   const [muted, setMuted] = useState(false);
+  // Quarter-turn mode: the player is rotated to fill a portrait-locked screen.
+  // Seeded from the cookie so the choice survives a reload, and written back
+  // when toggled.
+  const [rotated, setRotated] = useState(() => getAnimeRotate());
   const videoRef = useRef<HTMLVideoElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   // hls.js instance, kept out of state: attaching and destroying it is an
   // imperative side effect and re-rendering on it would thrash the player.
   const hlsRef = useRef<{ destroy: () => void } | null>(null);
@@ -67,6 +74,37 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
     setIndex(next);
     setShowList(false);
   }, [episodes.length]);
+
+  // Turn the player a quarter turn. As a convenience it also asks the browser
+  // for real fullscreen and a landscape orientation lock, but neither is
+  // required: the CSS rotation works on its own, which is the whole point on
+  // devices that cannot fullscreen or whose rotation is fixed. Every request is
+  // best-effort and rejected promises are ignored, since these APIs are absent
+  // or denied on many of the WebViews this app targets.
+  const toggleRotate = useCallback(() => {
+    const next = !rotated;
+    setRotated(next);
+    setAnimeRotate(next);
+    if (next) {
+      rootRef.current?.requestFullscreen?.({ navigationUI: "hide" }).catch(() => undefined);
+      const orientation = screen.orientation as (ScreenOrientation & {
+        lock?: (o: string) => Promise<void>;
+      }) | undefined;
+      orientation?.lock?.("landscape").catch(() => undefined);
+    } else {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined);
+      screen.orientation?.unlock?.();
+    }
+  }, [rotated]);
+
+  // Leaving the player must not leave the device locked in fullscreen/landscape,
+  // which would be confusing once the rest of the reader is shown.
+  useEffect(() => {
+    return () => {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined);
+      screen.orientation?.unlock?.();
+    };
+  }, []);
 
   // Resolve the episode to a playable stream. Re-runs when the episode or the
   // chosen server changes, so switching servers does not need a separate path.
@@ -150,9 +188,12 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
   // video itself does not have focus, so the native seek keys keep working.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === "Escape") {
         e.stopPropagation();
         onClose();
+      } else if (e.key === "r" || e.key === "R") {
+        toggleRotate();
       } else if (document.activeElement !== videoRef.current) {
         if (e.key === "ArrowRight" && hasNext) goTo(index + 1);
         else if (e.key === "ArrowLeft" && hasPrev) goTo(index - 1);
@@ -160,14 +201,17 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, hasNext, hasPrev, goTo, onClose]);
+  }, [index, hasNext, hasPrev, goTo, onClose, toggleRotate]);
 
   const servers: AnimeServer[] = stream?.servers?.length
     ? stream.servers
     : [{ type: "sub", name: stream?.server || "Default" }];
 
   return (
-    <div className={`fixed inset-0 z-[70] flex flex-col ${bg} ${textCol}`}>
+    <div
+      ref={rootRef}
+      className={`fixed inset-0 z-[70] flex flex-col ${bg} ${textCol} ${rotated ? "anime-rotate" : ""}`}
+    >
       {/* Header */}
       <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg}`}>
         <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -182,6 +226,17 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
           title={muted ? "Unmute" : "Mute"}
         >
           {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+        </button>
+        {/* Sits in the header rather than by the video so it stays on screen
+            once the player is rotated and other controls may be off-view. */}
+        <button
+          onClick={toggleRotate}
+          aria-label={rotated ? "Restore upright player" : "Rotate player to fill the screen"}
+          aria-pressed={rotated}
+          className={`p-2 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${rotated ? (isDark ? "bg-white/15 text-white" : "bg-gray-200 text-gray-900") : subText + " " + hoverBg}`}
+          title={rotated ? "Restore upright (R)" : "Rotate to fill screen (R)"}
+        >
+          <RotateCw className="h-4 w-4" />
         </button>
         <button
           onClick={() => setShowList((v) => !v)}

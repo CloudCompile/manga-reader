@@ -12,3 +12,31 @@
     margin: 0;
   }
 }
+
+/* Quarter-turn the anime player so a landscape video fills a screen that is
+   stuck in portrait. The element's layout box is swapped to viewport-height by
+   viewport-width, then rotated about its centre, so after the turn it covers the
+   whole viewport. */
+.anime-rotate {
+  position: fixed;
+  /* Reset all four insets first: the element also carries Tailwind's inset-0,
+     and leaving right/bottom set would over-constrain the box. */
+  inset: auto;
+  top: 50%;
+  left: 50%;
+  width: 100vh;
+  height: 100vw;
+  transform: translate(-50%, -50%) rotate(90deg);
+  transform-origin: center center;
+}
+
+/* dvh/dvw follow a collapsing URL bar, but older WebViews do not know them, so
+   the plain vh/vw above is the base and this only upgrades when supported. The
+   @supports block keeps the minifier from folding the two together and dropping
+   the fallback. */
+@supports (width: 100dvh) {
+  .anime-rotate {
+    width: 100dvh;
+    height: 100dvw;
+  }
+}

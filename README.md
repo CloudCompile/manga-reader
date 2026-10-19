@@ -98,6 +98,14 @@ our origin. `hls.js` drives playback where native HLS is missing (Chrome,
 Firefox, Android WebView); Safari and iOS use the native player. When an episode
 has no playlist the upstream iframe embed is used as a last resort.
 
+Some phones are stuck in portrait — fixed rotation, or no usable
+fullscreen/orientation lock — and landscape video wastes much of the screen
+there. The rotate button in the player header (or `R`) quarter-turns the entire
+player and sizes it to the height of the browser window, so the video fills the
+screen the long way up. It is pure CSS, so it works even where those APIs are
+missing; native fullscreen and a landscape orientation lock are requested as a
+bonus and are safe to refuse. The setting is remembered.
+
 ## OPDS
 
 An [OPDS](https://opds.io/) catalogue is served for external reader apps:

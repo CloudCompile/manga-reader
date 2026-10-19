@@ -578,6 +578,9 @@ export default function MangaReader() {
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // The player owns the keyboard while it is open (Esc closes it, R rotates
+      // it); without this the reader behind it would also react to T/W/F.
+      if (player) return;
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const isLeft = e.key === "ArrowLeft";
       const isRight = e.key === "ArrowRight";
@@ -621,7 +624,7 @@ export default function MangaReader() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [data, paged, currentPage, rtl, wide]);
+  }, [data, paged, currentPage, rtl, wide, player]);
 
   // Warm the neighbouring chapters after the current one settles, so Prev/Next
   // does not wait on a scrape. Runs at most once per chapter and is a no-op if

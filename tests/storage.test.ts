@@ -139,11 +139,13 @@ export async function run(): Promise<void> {
     storage.setWide(true);
     storage.setPaged(true);
     storage.setRtl(true);
+    storage.setAnimeRotate(true);
     assertEqual(storage.getTheme(), "light", "theme should persist");
     assertEqual(storage.getFitMode(), "original", "fit mode should persist");
     assertEqual(storage.getWide(), true, "wide should persist");
     assertEqual(storage.getPaged(), true, "paged should persist");
     assertEqual(storage.getRtl(), true, "rtl should persist");
+    assertEqual(storage.getAnimeRotate(), true, "anime rotate should persist");
   });
 
   await test("a reload keeps the paged and rtl flags", async () => {
@@ -153,6 +155,13 @@ export async function run(): Promise<void> {
     const fresh = await freshStorage("prefs-reload");
     assertEqual(fresh.getPaged(), true, "paged should survive a reload");
     assertEqual(fresh.getRtl(), true, "rtl should survive a reload");
+    assertEqual(fresh.getAnimeRotate(), true, "anime rotate should survive a reload");
+  });
+
+  await test("anime rotate defaults to off when absent", async () => {
+    clearCookies();
+    const fresh = await freshStorage("rotate-absent");
+    assertEqual(fresh.getAnimeRotate(), false, "a missing flag should read as off");
   });
 
   await test("a corrupt cookie falls back to defaults instead of throwing", async () => {

@@ -54,6 +54,10 @@ export interface StoredState {
   // screen. rtl flips the page-turn direction for right-to-left manga.
   paged: boolean;
   rtl: boolean;
+  // Rotate the anime player a quarter turn so a landscape video fills a phone
+  // that is physically stuck in portrait (fixed rotation, or a device whose
+  // fullscreen/orientation lock is unavailable). Device-wide, like theme.
+  animeRotate: boolean;
   // Highest chapter number read per series key ("sourceId:seriesSlug"). Drives
   // the read ticks in the chapter list and the "next unread" jump.
   read: Record<string, number>;
@@ -103,6 +107,7 @@ const DEFAULT_STATE: StoredState = {
   wide: false,
   paged: false,
   rtl: false,
+  animeRotate: false,
   read: {},
   seriesPrefs: {},
 };
@@ -249,6 +254,7 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
           wide: legacy.wide === true,
           paged: legacy.paged === true,
           rtl: legacy.rtl === true,
+          animeRotate: false,
           read,
           seriesPrefs,
         };
@@ -270,6 +276,7 @@ function parseState(raw: string | null, rawList: string | null, rawSettings: str
     wide: settings.wide === true,
     paged: settings.paged === true,
     rtl: settings.rtl === true,
+    animeRotate: settings.animeRotate === true,
     read,
     seriesPrefs,
   };
@@ -398,6 +405,7 @@ function persist(state: StoredState): void {
       wide: state.wide,
       paged: state.paged,
       rtl: state.rtl,
+      animeRotate: state.animeRotate,
       read: capRead(state.read),
       seriesPrefs: capSeriesPrefs(state.seriesPrefs),
     })
@@ -537,6 +545,15 @@ export function getRtl(): boolean {
 export function setRtl(rtl: boolean): void {
   const state = loadState();
   persist({ ...state, rtl });
+}
+
+export function getAnimeRotate(): boolean {
+  return loadState().animeRotate;
+}
+
+export function setAnimeRotate(animeRotate: boolean): void {
+  const state = loadState();
+  persist({ ...state, animeRotate });
 }
 
 // Records how far into a chapter the reader got, so it can resume later.

@@ -166,6 +166,17 @@ throw.
 - The player (`src/components/anime-player.tsx`) prefers `hls.js` where native
   HLS is missing and falls back to the native `<video>` on Safari/iOS. When an
   episode has no playlist, the upstream iframe embed is the last resort.
+- Screen rotation: the rotate button (or `R`) quarter-turns the whole player
+  with the `.anime-rotate` class, whose layout box is swapped to
+  viewport-height by viewport-width (`100dvh`/`100dvw`, `vh`/`vw` fallback)
+  before being rotated, so a landscape video fills a portrait-locked screen.
+  This is CSS-only on purpose: some devices have a fixed rotation or no usable
+  fullscreen/orientation-lock, so the turn must not depend on either. Native
+  fullscreen and `screen.orientation.lock("landscape")` are requested as a
+  convenience, best-effort only (every promise is ignored). The choice is
+  stored (`animeRotate`) and leaving the player releases fullscreen and the
+  orientation lock. While the player is open the reader's own shortcuts are
+  suspended so `T`/`W`/`F` do not act on the page behind it.
 - Manga details (`mangaDetails` in `sources.ts`) come from MangaDex through the
   same `findMangaDexMatch` gate the volume grouping uses. Note the single-manga
   endpoint returns `data` as an **object**, unlike the list endpoint's array.
@@ -215,7 +226,8 @@ must keep working.
 
 All reader and shelf state lives in `src/lib/storage.ts`, which writes a single
 `Secure` cookie rather than using `localStorage` (some WebViews stub it out).
-That covers theme, fit mode, two-page mode, history and the last page reached
+That covers theme, fit mode, two-page mode, the anime player's rotation flag,
+history and the last page reached
 in each chapter. Adding persisted state means extending `StoredState` and
 `parseState` together, since a missing field silently falls back to its default.
 
