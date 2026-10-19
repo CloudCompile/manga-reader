@@ -626,6 +626,21 @@ export default function MangaReader() {
     return () => window.removeEventListener("keydown", handler);
   }, [data, paged, currentPage, rtl, wide, player]);
 
+  // Lock the page behind an open overlay. The library scrolls the window itself,
+  // so without this a wheel or swipe over a panel that has nothing left to
+  // scroll (or over its backdrop) moves the catalogue underneath instead. The
+  // reader is h-screen/overflow-hidden, so this only ever bites the library.
+  useEffect(() => {
+    const overlayOpen = !!(showHistory || showSaved || showStats || showDetails || showAnime || showShortcuts || player);
+    if (!overlayOpen) return;
+    const body = document.body;
+    const previous = body.style.overflow;
+    body.style.overflow = "hidden";
+    return () => {
+      body.style.overflow = previous;
+    };
+  }, [showHistory, showSaved, showStats, showDetails, showAnime, showShortcuts, player]);
+
   // Warm the neighbouring chapters after the current one settles, so Prev/Next
   // does not wait on a scrape. Runs at most once per chapter and is a no-op if
   // that chapter is already cached.

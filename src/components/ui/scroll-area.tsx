@@ -13,12 +13,18 @@ function ScrollArea({
   return (
     <ScrollAreaPrimitive.Root
       data-slot="scroll-area"
-      className={cn("relative", className)}
+      // min-h-0 is load-bearing: the panel puts this in a flex column with
+      // flex-1, and a flex item defaults to min-height:auto, so without it the
+      // area grows to its content instead of scrolling and the panel spills
+      // past the viewport.
+      className={cn("relative min-h-0", className)}
       {...props}
     >
       <ScrollAreaPrimitive.Viewport
         data-slot="scroll-area-viewport"
-        className="focus-visible:ring-ring/50 size-full rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:outline-1"
+        // overscroll-contain stops a scroll that reaches the end of the panel
+        // from chaining to the page behind the overlay.
+        className="focus-visible:ring-ring/50 size-full rounded-[inherit] overscroll-contain transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:outline-1"
       >
         {children}
       </ScrollAreaPrimitive.Viewport>
