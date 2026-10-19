@@ -36,6 +36,11 @@ Ad-free manga reader. Paste a chapter URL from any supported site and read clean
 - Installable PWA: manifest, home-screen icon, and a service worker that keeps
   an offline app shell and caches pages already read
 - Mobile responsive
+- Manga details panel: description, authors, genres, status and cover for the
+  open series, resolved from MangaDex with a confidence gate
+- Watch the anime: matches the open series to its anime, lists the episodes, and
+  plays them in a built-in HLS player (sub and dub servers, server switching,
+  episode list, previous/next)
 - Storage works on constrained browsers: state is kept in a `Secure` cookie
   with an in-memory fallback, so it never depends on `localStorage`,
   `IndexedDB`, or cookie support.
@@ -62,11 +67,36 @@ against.
 | `/api/search` | GET | Search every source (`?q=`) |
 | `/api/titles` | GET | Shelf by default; `?all=1` pages the full catalogue (`offset`, `source`, `q`, `sort`, `hideEmpty`) |
 | `/api/proxy` | GET | Stream a page image (`?url=`); exempt from rate limiting |
+| `/api/details` | GET | Series metadata from MangaDex (`?title=`) |
+| `/api/anime/search` | GET | Search anime titles (`?q=`) |
+| `/api/anime/info` | GET | Anime metadata (`?id=`) |
+| `/api/anime/episodes` | GET | Episode list (`?id=`) |
+| `/api/anime/stream` | GET | Resolve an episode to a playable stream (`?id=`, optional `server=`) |
+| `/api/anime/hls` | GET | Relay an HLS playlist or segment (`?url=`); exempt from rate limiting |
+| `/api/anime/watch` | GET | Match a manga title to its anime, with episodes (`?title=`, `aliases=`, or `id=`) |
 
 Scrape, chapter-list and search routes are rate limited per client
 (30 requests/minute, 60 for chapter lists) and return `429` with `Retry-After`
 when over budget. Image proxying is deliberately not limited, since one chapter
-view legitimately fetches dozens of images.
+view legitimately fetches dozens of images. The anime HLS relay is exempt for
+the same reason: one episode pulls many segments.
+
+## Anime
+
+The "Watch the anime" action matches the open manga to an anime through an
+external anime API (`ANIME_API`, default `https://animeapi.cjhauser.me`) and
+plays it in the built-in player. Matching is by normalised title overlap, tried
+against the scraped title and any MangaDex aliases; a match must clear a
+confidence threshold, and anything weaker shows the closest search hits so the
+reader can pick the right one.
+
+Streams are HLS. The CDN pins `Access-Control-Allow-Origin` to the provider's
+own player, so the browser cannot fetch a playlist or segment directly. The
+`/api/anime/hls` route relays both, rewriting every child URI (and any
+`EXT-X-KEY` URI) to point back through itself, so the player only ever talks to
+our origin. `hls.js` drives playback where native HLS is missing (Chrome,
+Firefox, Android WebView); Safari and iOS use the native player. When an episode
+has no playlist the upstream iframe embed is used as a last resort.
 
 ## OPDS
 
@@ -110,7 +140,7 @@ Open [http://localhost:3000](http://localhost:3000).
 ## Tests
 
 ```bash
-npm test        # storage, sources, cache, rate limiter, OPDS, catalogue order
+npm test        # storage, sources, cache, rate limiter, OPDS, catalogue order, anime
 npm run typecheck
 ```
 

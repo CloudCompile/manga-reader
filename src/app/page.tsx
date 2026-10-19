@@ -35,7 +35,12 @@ import {
   Trash2,
   ArrowDownUp,
   RotateCcw,
+  Info,
+  Play,
+  Tv,
 } from "lucide-react";
+import AnimePlayer from "@/components/anime-player";
+import type { AnimeEpisode, AnimeSearchResult } from "@/lib/anime";
 import {
   getHistory,
   pushHistory,
@@ -117,6 +122,34 @@ interface TitlesResponse {
   total: number;
   offset: number;
   hasMore: boolean;
+}
+
+// Series metadata resolved from MangaDex. Present only when a confident match
+// was found, so every field past the title is optional.
+interface MangaDetails {
+  title: string;
+  description?: string;
+  cover?: string;
+  authors: string[];
+  artists: string[];
+  genres: string[];
+  aliases: string[];
+  status?: string;
+  year?: number;
+  demographic?: string;
+  contentRating?: string;
+  mangadexId: string;
+}
+
+// What "watch the anime" resolved to for the open series.
+interface AnimeMatch {
+  matched: boolean;
+  animeTitle?: string;
+  poster?: string;
+  episodes: AnimeEpisode[];
+  // Populated when nothing matched confidently, so the picker can offer the
+  // closest search hits instead of a dead end.
+  alternatives?: AnimeSearchResult[];
 }
 
 // A transient message shown over the current view. Errors are deliberately not
@@ -305,6 +338,25 @@ export default function MangaReader() {
   const [prefetchProgress, setPrefetchProgress] = useState<{ done: number; total: number } | null>(null);
   // Reading stats panel (#10).
   const [showStats, setShowStats] = useState(false);
+
+  // ─── Manga details + anime ──────────────────────────────
+  // Details are keyed to the open series and fetched once per title.
+  const [showDetails, setShowDetails] = useState(false);
+  const [details, setDetails] = useState<MangaDetails | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState("");
+  const detailsCache = useRef<Map<string, MangaDetails | null>>(new Map());
+
+  // Anime picker + player. The match is per series; the player takes over the
+  // whole screen and is rendered from the landing view too.
+  const [showAnime, setShowAnime] = useState(false);
+  const [animeMatch, setAnimeMatch] = useState<AnimeMatch | null>(null);
+  const [animeLoading, setAnimeLoading] = useState(false);
+  const [animeError, setAnimeError] = useState("");
+  const [animeQuery, setAnimeQuery] = useState("");
+  const [animeSearchResults, setAnimeSearchResults] = useState<AnimeSearchResult[]>([]);
+  const [animeSearching, setAnimeSearching] = useState(false);
+  const [player, setPlayer] = useState<{ title: string; episodes: AnimeEpisode[]; index: number } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const imgRefs = useRef<Map<number, HTMLImageElement>>(new Map());
@@ -827,6 +879,96 @@ export default function MangaReader() {
     else document.documentElement.requestFullscreen().catch(() => {});
   };
 
+  // ─── Manga details ──────────────────────────────────────
+  // The detail panel opens with whatever the chapter scrape already carries and
+  // fills in the rest from MangaDex. A title with no confident match keeps the
+  // scraped summary rather than showing a wrong one.
+  const openDetails = useCallback(async () => {
+    const name = dataRef.current?.mangaName;
+    if (!name) return;
+    setShowDetails(true);
+    setDetailsError("");
+    const cached = detailsCache.current.get(name);
+    if (cached !== undefined) {
+      setDetails(cached);
+      return;
+    }
+    setDetailsLoading(true);
+    try {
+      const res = await fetch(`/api/details?title=${encodeURIComponent(name)}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Could not load details");
+      const found: MangaDetails | null = json.details || null;
+      detailsCache.current.set(name, found);
+      setDetails(found);
+      if (!found) setDetailsError("No extra details found for this title.");
+    } catch (err) {
+      setDetailsError(err instanceof Error ? err.message : "Could not load details");
+    } finally {
+      setDetailsLoading(false);
+    }
+  }, []);
+
+  // ─── Anime ──────────────────────────────────────────────
+  // Resolves the open manga to an anime. `id` skips the title match and loads a
+  // specific entry, which is what the picker uses when the reader chooses a
+  // different hit from the search results.
+  const loadAnime = useCallback(async (id?: string) => {
+    setShowAnime(true);
+    setAnimeLoading(true);
+    setAnimeError("");
+    const current = dataRef.current;
+    const title = current?.mangaName || "";
+    try {
+      const params = new URLSearchParams();
+      if (id) params.set("id", id);
+      else params.set("title", title);
+      // Aliases from the detail lookup (romaji, translated names) give the
+      // matcher more to work with; the cache makes that lookup free when the
+      // reader already opened the details panel.
+      const cached = detailsCache.current.get(title);
+      if (cached?.aliases?.length) params.set("aliases", cached.aliases.slice(0, 3).join("|"));
+      const res = await fetch(`/api/anime/watch?${params.toString()}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Could not find the anime");
+      const match: AnimeMatch = json.matched
+        ? {
+            matched: true,
+            animeTitle: json.anime?.title,
+            poster: json.anime?.poster,
+            episodes: json.episodes || [],
+          }
+        : { matched: false, episodes: [], alternatives: json.alternatives || [] };
+      setAnimeMatch(match);
+      setAnimeQuery(json.matched ? "" : title);
+    } catch (err) {
+      setAnimeError(err instanceof Error ? err.message : "Could not find the anime");
+      setAnimeMatch(null);
+    } finally {
+      setAnimeLoading(false);
+    }
+  }, []);
+
+  const searchAnimeTitles = async () => {
+    if (!animeQuery.trim()) return;
+    setAnimeSearching(true);
+    try {
+      const res = await fetch(`/api/anime/search?q=${encodeURIComponent(animeQuery)}`);
+      const json = await res.json();
+      if (res.ok) setAnimeSearchResults(json.results || []);
+    } catch {
+      /* the picker shows whatever it already had */
+    } finally {
+      setAnimeSearching(false);
+    }
+  };
+
+  const startEpisode = (episodes: AnimeEpisode[], index: number, title?: string) => {
+    if (!episodes.length) return;
+    setPlayer({ title: title || animeMatch?.animeTitle || data?.mangaName || "Anime", episodes, index });
+    setShowAnime(false);
+  };
+
   // Restore the saved page once the images have been laid out.
   useEffect(() => {
     const pending = resumeRef.current;
@@ -1255,6 +1397,158 @@ export default function MangaReader() {
     </>
   );
 
+  // ─── Details + anime panels ────────────────────────
+  // Defined once and rendered in both the landing and reader views, like the
+  // library panels, so "watch the anime" is reachable from either.
+  const DetailsPanelView = (
+    <SidePanel title="Manga details" icon={<Info className="h-4 w-4" />} show={showDetails} onClose={() => setShowDetails(false)}>
+      <div className="p-4 space-y-4">
+        <div className="flex gap-4">
+          <div className={`w-24 shrink-0 rounded-lg overflow-hidden ${isDark ? "bg-white/5" : "bg-gray-100"}`} style={{ aspectRatio: "2/3" }}>
+            {details?.cover ? (
+              <img src={PROXY(details.cover)} alt="" className="w-full h-full object-cover" />
+            ) : (
+              <div className={`w-full h-full flex items-center justify-center ${subText}`}><BookOpen className="h-6 w-6" /></div>
+            )}
+          </div>
+          <div className="min-w-0 flex-1 space-y-1">
+            <h3 className={`text-sm font-semibold leading-snug ${isDark ? "text-white" : "text-gray-900"}`}>
+              {details?.title || data?.mangaName || "Unknown"}
+            </h3>
+            {details?.year && <p className={`text-xs ${subText}`}>{details.year}</p>}
+            {(details?.authors?.length || details?.artists?.length) ? (
+              <p className={`text-xs ${subText}`}>
+                {Array.from(new Set([...(details.authors || []), ...(details.artists || [])])).join(", ")}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-1 pt-1">
+              {details?.status && <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isDark ? "bg-white/10 text-white/60" : "bg-gray-100 text-gray-600"}`}>{details.status}</span>}
+              {details?.demographic && <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isDark ? "bg-white/10 text-white/60" : "bg-gray-100 text-gray-600"}`}>{details.demographic}</span>}
+              {data?.sourceName && <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isDark ? "bg-white/10 text-white/60" : "bg-gray-100 text-gray-600"}`}>{data.sourceName}</span>}
+            </div>
+          </div>
+        </div>
+
+        {detailsLoading && (
+          <div className="flex items-center gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" /><span className={subText}>Loading details…</span></div>
+        )}
+        {!detailsLoading && detailsError && <p className={`text-xs ${subText}`}>{detailsError}</p>}
+
+        {details?.genres?.length ? (
+          <div className="flex flex-wrap gap-1">
+            {details.genres.map((g) => (
+              <span key={g} className={`text-[10px] px-2 py-0.5 rounded-full ${isDark ? "bg-white/[0.06] text-white/70" : "bg-gray-100 text-gray-600"}`}>{g}</span>
+            ))}
+          </div>
+        ) : null}
+
+        {details?.description && (
+          <p className={`text-xs leading-relaxed whitespace-pre-line ${isDark ? "text-white/70" : "text-gray-600"}`}>{details.description}</p>
+        )}
+
+        <div className="space-y-2 pt-1">
+          <Button className="w-full" onClick={() => { setShowDetails(false); loadAnime(); }}>
+            <Play className="h-4 w-4 mr-2" />Watch the anime
+          </Button>
+          {details?.mangadexId && (
+            <a href={`https://mangadex.org/title/${details.mangadexId}`} target="_blank" rel="noreferrer noopener"
+              className={`block text-center text-xs underline ${subText}`}>
+              Details from MangaDex
+            </a>
+          )}
+        </div>
+      </div>
+    </SidePanel>
+  );
+
+  const AnimePanelView = (
+    <SidePanel title="Watch the anime" icon={<Tv className="h-4 w-4" />} show={showAnime} onClose={() => setShowAnime(false)}>
+      <div className="p-4 space-y-4">
+        <div className="flex gap-2">
+          <Input placeholder="Search anime…" value={animeQuery} onChange={(e) => setAnimeQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && searchAnimeTitles()} aria-label="Search anime"
+            className={isDark ? "bg-white/5 border-white/10 text-white placeholder:text-white/30" : "bg-gray-50 border-gray-200 text-gray-900"} />
+          <Button size="sm" onClick={searchAnimeTitles} disabled={animeSearching}>
+            {animeSearching ? <Loader2 className="h-4 w-4 animate-spin" /> : "Go"}
+          </Button>
+        </div>
+
+        {animeLoading && (
+          <div className="flex items-center gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" /><span className={subText}>Looking for the anime…</span></div>
+        )}
+        {animeError && <p className={`text-xs ${subText}`}>{animeError}</p>}
+
+        {!animeLoading && animeMatch?.matched && (
+          <>
+            <div className="flex gap-3 items-start">
+              {animeMatch.poster && (
+                <img src={PROXY(animeMatch.poster)} alt="" className="w-16 rounded-lg object-cover" style={{ aspectRatio: "2/3" }} />
+              )}
+              <div className="min-w-0">
+                <h3 className={`text-sm font-semibold leading-snug ${isDark ? "text-white" : "text-gray-900"}`}>{animeMatch.animeTitle}</h3>
+                <p className={`text-xs ${subText}`}>{animeMatch.episodes.length} episode{animeMatch.episodes.length === 1 ? "" : "s"}</p>
+              </div>
+            </div>
+            <div className="space-y-1">
+              {animeMatch.episodes.map((e, i) => (
+                <button key={e.id} onClick={() => startEpisode(animeMatch.episodes, i)}
+                  className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left text-sm transition-colors ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
+                  <Play className={`h-3.5 w-3.5 shrink-0 ${subText}`} />
+                  <span className="font-medium shrink-0">{e.num}</span>
+                  <span className={`truncate text-xs ${subText}`}>{e.title}</span>
+                </button>
+              ))}
+              {!animeMatch.episodes.length && <p className={`text-xs ${subText}`}>No episodes listed for this title.</p>}
+            </div>
+          </>
+        )}
+
+        {!animeLoading && !animeMatch?.matched && (() => {
+          // Search hits and the unmatched-match alternatives are the same shape,
+          // so they share one list. Without this a plain search had nowhere to
+          // render its results, since a match only exists once one is picked.
+          const picks = animeSearchResults.length ? animeSearchResults : animeMatch?.alternatives || [];
+          if (!picks.length) {
+            return !animeError ? (
+              <p className={`text-xs ${subText}`}>Search for a title above, or open a manga and use “Watch the anime”.</p>
+            ) : null;
+          }
+          return (
+            <div className="space-y-2">
+              {animeMatch && !animeMatch.matched && (
+                <p className={`text-xs ${subText}`}>
+                  No confident match for “{data?.mangaName || animeQuery}”. Pick the right one below.
+                </p>
+              )}
+              {picks.map((r) => (
+                <button key={r.id} onClick={() => loadAnime(r.id)}
+                  className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left text-sm transition-colors ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
+                  {r.poster && <img src={PROXY(r.poster)} alt="" className="w-8 rounded object-cover shrink-0" style={{ aspectRatio: "2/3" }} />}
+                  <span className="min-w-0">
+                    <span className="block truncate">{r.title}</span>
+                    {r.japaneseTitle && <span className={`block truncate text-[10px] ${subText}`}>{r.japaneseTitle}</span>}
+                  </span>
+                </button>
+              ))}
+            </div>
+          );
+        })()}
+      </div>
+    </SidePanel>
+  );
+
+  // The player replaces the whole view while it is open, so it sits outside the
+  // landing/reader split and both can open it.
+  const PlayerView = player ? (
+    <AnimePlayer
+      title={player.title}
+      episodes={player.episodes}
+      startIndex={player.index}
+      isDark={isDark}
+      onClose={() => setPlayer(null)}
+    />
+  ) : null;
+
   const BannerView = banner ? (
     <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[60] w-[min(92vw,32rem)]" role="status" aria-live="polite">
       <div className={`flex items-start gap-3 rounded-lg border px-4 py-3 shadow-xl ${isDark ? "bg-[#1a1a1a] border-white/15 text-white" : "bg-white border-gray-300 text-gray-900"}`}>
@@ -1288,6 +1582,7 @@ export default function MangaReader() {
     return (
       <div className={`min-h-screen flex flex-col ${bg} ${textCol}`}>
         {BannerView}
+        {PlayerView}
         {/* Header */}
         <header className={`border-b px-6 py-4 flex items-center justify-between ${isDark ? "border-white/10" : "border-gray-200"} ${panelBg}`}>
           <div className="flex items-center gap-3">
@@ -1295,6 +1590,7 @@ export default function MangaReader() {
             <h1 className={`text-xl font-bold ${isDark ? "text-white" : "text-gray-900"}`}>Manga Reader</h1>
           </div>
           <div className="flex items-center gap-2">
+            <button onClick={() => setShowAnime(true)} aria-label="Watch anime" className={`px-2 py-1.5 rounded text-xs ${subText} ${hoverBg}`} title="Search and watch anime"><Tv className="h-4 w-4 inline mr-1" /><span className="hidden sm:inline">Anime</span></button>
             <button onClick={() => setShowSearch(true)} aria-label="Search manga" className={`p-2 rounded ${subText} ${hoverBg}`} title="Search manga"><Search className="h-5 w-5" /></button>
             <button onClick={() => setShowHistory(true)} aria-label="Reading history" className={`p-2 rounded ${subText} ${hoverBg}`} title="History"><History className="h-5 w-5" /></button>
             <button onClick={() => setShowSaved(true)} aria-label="Reading list" className={`p-2 rounded ${subText} ${hoverBg}`} title="Reading list"><Bookmark className="h-5 w-5" /></button>
@@ -1548,6 +1844,8 @@ export default function MangaReader() {
         </SidePanel>
 
         {LibraryPanelsView}
+        {DetailsPanelView}
+        {AnimePanelView}
       </div>
     );
   }
@@ -1558,7 +1856,10 @@ export default function MangaReader() {
   return (
     <div className={`h-screen relative flex flex-col ${bg} ${textCol} overflow-hidden`}>
       {BannerView}
+      {PlayerView}
       {LibraryPanelsView}
+      {DetailsPanelView}
+      {AnimePanelView}
       {/* Top bar */}
       <header className={`shrink-0 border-b px-3 py-2 flex items-center gap-2 ${barBg} z-40 transition-transform duration-300 ${chromeHidden ? "-translate-y-full" : ""}`} style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}>
         <button onClick={() => setShowMobileMenu((v) => !v)} aria-label="Open reader menu" aria-expanded={showMobileMenu} className={`p-2.5 rounded sm:hidden focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${hoverBg}`}><Menu className="h-5 w-5" /></button>
@@ -1571,6 +1872,8 @@ export default function MangaReader() {
 
         {/* Desktop buttons */}
         <div className="hidden sm:flex items-center gap-1">
+          <button onClick={openDetails} aria-label="Manga details" aria-pressed={showDetails} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Manga details"><Info className="h-4 w-4" /></button>
+          <button onClick={() => loadAnime()} aria-label="Watch the anime" className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title="Watch the anime"><Tv className="h-4 w-4" /></button>
           <button onClick={toggleSaved} aria-label={savedHere ? "Remove from reading list" : "Add to reading list"} aria-pressed={savedHere} className={`p-1.5 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${isDark ? "focus-visible:outline-white/60" : "focus-visible:outline-gray-500"} ${subText} ${hoverBg}`} title={savedHere ? "Saved to reading list (S)" : "Save to reading list (S)"}>
             {savedHere ? <BookmarkCheck className="h-4 w-4" /> : <BookmarkPlus className="h-4 w-4" />}
           </button>
@@ -1631,6 +1934,12 @@ export default function MangaReader() {
           </button>
           <button onClick={() => { setShowStats(true); setShowMobileMenu(false); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
             <BarChart3 className="h-3.5 w-3.5 inline mr-1" />Stats
+          </button>
+          <button onClick={() => { setShowMobileMenu(false); openDetails(); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
+            <Info className="h-3.5 w-3.5 inline mr-1" />Details
+          </button>
+          <button onClick={() => { setShowMobileMenu(false); loadAnime(); }} className={`px-3 py-2 rounded text-xs ${hoverBg}`}>
+            <Tv className="h-3.5 w-3.5 inline mr-1" />Watch anime
           </button>
           <button onClick={() => { toggleWide(); setShowMobileMenu(false); }} aria-pressed={wide} className={`px-3 py-2 rounded text-xs ${wide ? (isDark ? "bg-white/15" : "bg-gray-200") : ""} ${hoverBg}`}>
             <Columns2 className="h-3.5 w-3.5 inline mr-1" />Two-page

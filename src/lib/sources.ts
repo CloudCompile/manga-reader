@@ -138,7 +138,13 @@ interface Source {
 export const PROXY_BASE =
   process.env.CORS_PROXY || "https://cors-proxy.christopher-j-hauser2025.workers.dev";
 
-const UA =
+// The anime API this app talks to for episode metadata and streams. Kept here
+// (rather than in the anime lib) so it is overridable the same way as
+// PROXY_BASE, and so the source-health check can reach it without a cycle.
+export const ANIME_API =
+  process.env.ANIME_API || "https://animeapi.cjhauser.me";
+
+export const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
 // ───────────────────────────────────────────────────────────
@@ -1853,5 +1859,164 @@ export async function checkSourceHealth(probe: HealthProbe): Promise<HealthResul
 
 export async function checkAllSources(): Promise<HealthResult[]> {
   return Promise.all(HEALTH_PROBES.map(checkSourceHealth));
+}
+
+// The anime API is a separate service from the scraped sources, so it gets its
+// own probe: without it "watch the anime" fails silently, and a health check is
+// the only place that would say why.
+export async function checkAnimeApiHealth(): Promise<HealthResult> {
+  const url = `${ANIME_API}/api/search?keyword=naruto`;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA, Accept: "application/json" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return { id: "anime-api", url, ok: false, images: 0, error: `HTTP ${res.status}` };
+    const json = (await res.json()) as { results?: { data?: unknown[] } };
+    const count = Array.isArray(json.results?.data) ? json.results.data.length : 0;
+    return {
+      id: "anime-api",
+      url,
+      ok: count > 0,
+      images: 0,
+      error: count > 0 ? undefined : "no results returned",
+    };
+  } catch (e) {
+    return { id: "anime-api", url, ok: false, images: 0, error: (e as Error).message };
+  }
+}
+
+// ───────────────────────────────────────────────────────────
+// Manga details
+// ───────────────────────────────────────────────────────────
+//
+// The supported sites publish almost no series metadata (their "description"
+// is SEO filler), so the detail panel draws on MangaDex — the same source the
+// volume grouping already trusts. Only a confident title match is used; when
+// there is none the caller gets null and the UI shows just what was scraped.
+
+export interface MangaDetails {
+  title: string;
+  description?: string;
+  // Cover art URL, already absolute. The UI proxies it like any other image.
+  cover?: string;
+  authors: string[];
+  artists: string[];
+  genres: string[];
+  // Alternate and romanised names, used to find the matching anime when the
+  // scraped title is not the one the anime index uses.
+  aliases: string[];
+  status?: string;
+  year?: number;
+  demographic?: string;
+  contentRating?: string;
+  // The MangaDex id this was resolved from, for linking back.
+  mangadexId: string;
+  score: number;
+}
+
+interface MangaDexManga {
+  id: string;
+  attributes?: {
+    title?: Record<string, string>;
+    altTitles?: Record<string, string>[];
+    description?: Record<string, string>;
+    status?: string;
+    year?: number;
+    contentRating?: string;
+    publicationDemographic?: string;
+    tags?: { attributes?: { name?: Record<string, string> } }[];
+  };
+  relationships?: {
+    type?: string;
+    attributes?: { fileName?: string; name?: string };
+  }[];
+}
+
+interface MangaDexDetailsResponse {
+  // The single-manga endpoint returns `data` as an object, unlike the list
+  // endpoint's array, so both shapes are accepted here.
+  data?: MangaDexManga | MangaDexManga[];
+}
+
+const DETAILS_CACHE = new TtlCache<string, MangaDetails | null>({ ttlMs: TTL, maxEntries: 200 });
+
+// Prefers English, then any language, so a title with no English description
+// still contributes what it has rather than being dropped entirely.
+function pickLocalised(map?: Record<string, string>): string | undefined {
+  if (!map) return undefined;
+  if (map.en) return map.en;
+  const first = Object.values(map).find((v) => typeof v === "string" && v.trim());
+  return first?.trim() || undefined;
+}
+
+export async function mangaDetails(mangaName: string): Promise<MangaDetails | null> {
+  const key = normTitle(mangaName);
+  if (!key) return null;
+  const cached = DETAILS_CACHE.get(key);
+  if (cached !== undefined) return cached;
+
+  let out: MangaDetails | null = null;
+  try {
+    const match = await findMangaDexMatch(mangaName);
+    if (match) {
+      const res = await fetch(
+        `${MANGADEX_API}/manga/${match.id}?includes%5B%5D=cover_art&includes%5B%5D=author&includes%5B%5D=artist`,
+        { headers: { "User-Agent": UA }, cache: "no-store" }
+      );
+      if (res.ok) {
+        const json = (await res.json()) as MangaDexDetailsResponse;
+        const m = Array.isArray(json.data) ? json.data[0] : json.data;
+        const a = m?.attributes;
+        if (m && a) {
+          const authors: string[] = [];
+          const artists: string[] = [];
+          let cover: string | undefined;
+          for (const rel of m.relationships || []) {
+            if (rel.type === "cover_art" && rel.attributes?.fileName) {
+              cover = `https://uploads.mangadex.org/covers/${m.id}/${rel.attributes.fileName}`;
+            } else if (rel.type === "author" && rel.attributes?.name) {
+              authors.push(rel.attributes.name);
+            } else if (rel.type === "artist" && rel.attributes?.name) {
+              artists.push(rel.attributes.name);
+            }
+          }
+          const genres = (a.tags || [])
+            .map((t) => pickLocalised(t.attributes?.name))
+            .filter((g): g is string => !!g);
+          // The alternates, minus the name we already have, so the anime match
+          // can try the romanised form when the scraped title misses.
+          const seen = new Set<string>([key]);
+          const aliases: string[] = [];
+          for (const t of match.titles) {
+            const n = normTitle(t);
+            if (!n || seen.has(n) || VOLUME_EXCLUDE.test(t)) continue;
+            seen.add(n);
+            aliases.push(t);
+          }
+          out = {
+            title: pickLocalised(a.title) || match.title,
+            description: pickLocalised(a.description),
+            cover,
+            authors,
+            artists,
+            genres,
+            aliases: aliases.slice(0, 8),
+            status: a.status,
+            year: typeof a.year === "number" ? a.year : undefined,
+            demographic: a.publicationDemographic,
+            contentRating: a.contentRating,
+            mangadexId: m.id,
+            score: match.score,
+          };
+        }
+      }
+    }
+  } catch {
+    out = null;
+  }
+  DETAILS_CACHE.set(key, out);
+  return out;
 }
 

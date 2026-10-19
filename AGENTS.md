@@ -33,15 +33,26 @@ body rather than skipping the release.
 - `src/lib/sources.ts` — one `Source` object per site behind a single
   scrape/list/search/browse API. Fetches try direct first, then fall back to the
   `cors-proxy.christopher-j-hauser2025.workers.dev` worker (`PROXY_BASE`).
+  `ANIME_API` (the anime service base) lives here too, so it is overridable the
+  same way.
 - API routes: `/api/scrape`, `/api/chapters`, `/api/search`, `/api/titles`,
   `/api/proxy`. The proxy route is what serves chapter images to the browser.
-  Versioned aliases for the four data routes live under `/api/v1/*` and must
+  Versioned aliases for the data routes live under `/api/v1/*` and must
   stay in step with their `/api` counterparts; they are the stable surface.
+  A new route means a matching `src/app/api/v1/<same path>/route.ts` that just
+  re-exports `GET`.
+- `src/lib/net.ts` — the shared outbound-fetch guards: `okPublicUrl` /
+  `isPrivateHost` (SSRF), `fetchFollowingSafe` (manual redirects, each hop
+  re-checked), and `readCapped` (byte ceiling). `/api/proxy` and
+  `/api/anime/hls` both use these; do not hand-roll a private-host check in a
+  route, and do not use `redirect: "follow"`, which skips the per-hop check.
 - `src/lib/ratelimit.ts` — in-memory fixed-window limiter (`withRateLimit`).
   Applied to scrape, chapters and search. `/api/proxy` is deliberately exempt:
   one chapter view fetches dozens of images, so a per-request cap there would
   break normal reading. `withRateLimit` is generic over the handler's own
   parameter list so the wrapped export still satisfies Next's route types.
+  `/api/anime/hls` is exempt for the same reason — one episode pulls many
+  segments.
 - `src/lib/opds.ts` + `src/app/opds/{,all,shelf,search}` — OPDS catalogue for
   external reader apps. `acquisitionFeed` escapes every field; a raw `&` in a
   title silently breaks the XML, so titles/aliases go through the escaper.
@@ -130,6 +141,34 @@ registered source with `ok`/`count`/`error` instead of silently dropping the
 ones that threw, and the shelf surfaces the failures with a retry. A registered
 source with `count: 0` (currently `chainsawman`) means its listing loaded but
 yielded no titles — that is health, not an exception.
+
+## Anime integration
+
+`src/lib/anime.ts` is the only place that talks to the anime API. Everything it
+returns is parsed defensively (`parseSearchItem`, `parseAnimeInfo`,
+`parseEpisodes`, `parseStream` are pure and tested) because the upstream JSON is
+shallow and loosely typed — an unrecognised shape yields "no match", never a
+throw.
+
+- Matching a manga to an anime is `findAnimeMatch`, by normalised title overlap
+  (`titleSimilarity`, with a whole-word prefix boost and a leading-article
+  strip). It needs a score of 0.6+; below that `/api/anime/watch` returns
+  `matched: false` plus the raw search hits so the picker can offer the closest
+  entries. Passing `?id=` to `/api/anime/watch` skips matching entirely.
+- Episode ids from the API already carry the `?ep=` suffix; pass them back
+  verbatim, do not rebuild them.
+- Streaming is HLS. The CDN sets `Access-Control-Allow-Origin` to the provider's
+  own player, so the browser cannot fetch playlists or segments directly.
+  `/api/anime/hls` relays them and rewrites every child URI (and any
+  `EXT-X-KEY` URI) through itself, so the player stays on our origin. Playlists
+  and segments are both labelled `image/jpeg`, so `isPlaylist` sniffs the body
+  (`#EXTM3U`) instead of trusting the content type.
+- The player (`src/components/anime-player.tsx`) prefers `hls.js` where native
+  HLS is missing and falls back to the native `<video>` on Safari/iOS. When an
+  episode has no playlist, the upstream iframe embed is the last resort.
+- Manga details (`mangaDetails` in `sources.ts`) come from MangaDex through the
+  same `findMangaDexMatch` gate the volume grouping uses. Note the single-manga
+  endpoint returns `data` as an **object**, unlike the list endpoint's array.
 
 ## Errors and reader interaction
 
