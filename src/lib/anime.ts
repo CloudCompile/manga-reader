@@ -150,34 +150,64 @@ function asStringList(v: unknown): string[] {
 
 export interface RawSearchItem {
   id?: unknown;
+  slug?: unknown;
   title?: unknown;
   japanese_title?: unknown;
+  japaneseTitle?: unknown;
   poster?: unknown;
   showType?: unknown;
+  type?: unknown;
+  subEpisodes?: unknown;
+  dubEpisodes?: unknown;
   tvInfo?: { showType?: unknown; sub?: unknown; dub?: unknown; eps?: unknown };
 }
 
 export function parseSearchItem(raw: RawSearchItem): AnimeSearchResult | null {
-  const id = asString(raw.id);
+  const rawId = asString(raw.id);
   const title = asString(raw.title);
-  if (!id || !title) return null;
+  if (!rawId || !title) return null;
+  // A provider hit carries a numeric id plus a slug; the info and episodes
+  // routes take the canonical `<slug>-<dataId>` form. Canonical hits already
+  // arrive in that form and are left alone.
+  const slug = asString(raw.slug);
+  const id = slug && /^[0-9]+$/.test(rawId) ? `${slug}-${rawId}` : rawId;
   return {
     id,
     title,
-    japaneseTitle: asString(raw.japanese_title),
+    japaneseTitle: asString(raw.japanese_title) || asString(raw.japaneseTitle),
     poster: asString(raw.poster),
-    showType: asString(raw.showType) || asString(raw.tvInfo?.showType),
-    subEpisodes: asString(raw.tvInfo?.sub),
-    dubEpisodes: asString(raw.tvInfo?.dub),
+    showType: asString(raw.showType) || asString(raw.type) || asString(raw.tvInfo?.showType),
+    subEpisodes: asString(raw.tvInfo?.sub) || asString(raw.subEpisodes),
+    dubEpisodes: asString(raw.tvInfo?.dub) || asString(raw.dubEpisodes),
   };
+}
+
+// The search endpoint now fans out over several providers and reports each one
+// under `sources[].results`, leaving the flat `data` array empty. Flatten both
+// shapes so a provider rollback does not empty the picker again.
+interface RawSearchResults {
+  data?: RawSearchItem[];
+  sources?: { results?: RawSearchItem[] }[];
 }
 
 export async function searchAnime(query: string): Promise<AnimeSearchResult[]> {
   const q = query.trim();
   if (!q) return [];
-  const results = await apiGet<{ data?: RawSearchItem[] }>("search", { keyword: q });
-  const items = Array.isArray(results?.data) ? results.data : [];
-  return items.map(parseSearchItem).filter((r): r is AnimeSearchResult => r !== null);
+  const results = await apiGet<RawSearchResults>("search", { keyword: q });
+  const items: RawSearchItem[] = [];
+  if (Array.isArray(results?.data)) items.push(...results.data);
+  for (const source of results?.sources || []) {
+    if (Array.isArray(source?.results)) items.push(...source.results);
+  }
+  const seen = new Set<string>();
+  const out: AnimeSearchResult[] = [];
+  for (const item of items) {
+    const parsed = parseSearchItem(item);
+    if (!parsed || seen.has(parsed.id)) continue;
+    seen.add(parsed.id);
+    out.push(parsed);
+  }
+  return out;
 }
 
 // ─── Info ─────────────────────────────────────────────────
@@ -277,25 +307,33 @@ export async function animeEpisodes(id: string): Promise<AnimeEpisode[]> {
 
 // ─── Stream ───────────────────────────────────────────────
 
+interface RawStreamLink {
+  iframe?: unknown;
+  link?: { file?: unknown; type?: unknown };
+  server?: unknown;
+}
+
 export interface RawStream {
-  streamingLink?: {
-    iframe?: unknown;
-    link?: { file?: unknown; type?: unknown };
-    server?: unknown;
-  };
-  servers?: { type?: unknown; serverName?: unknown }[];
+  // Either a single link (older API) or a list of per-server links.
+  streamingLink?: RawStreamLink | RawStreamLink[];
+  servers?: { type?: unknown; serverName?: unknown; server_name?: unknown }[];
 }
 
 export function parseStream(result: unknown, requestedServer?: string): AnimeStream | null {
   if (!result || typeof result !== "object") return null;
   const r = result as RawStream;
-  const link = r.streamingLink || {};
+  const links = Array.isArray(r.streamingLink)
+    ? r.streamingLink
+    : r.streamingLink
+      ? [r.streamingLink]
+      : [];
   const servers: AnimeServer[] = [];
   for (const s of r.servers || []) {
-    const name = asString(s.serverName);
+    const name = asString(s.serverName) || asString(s.server_name);
     if (!name) continue;
     if (!servers.some((x) => x.name === name)) servers.push({ type: asString(s.type) || "sub", name });
   }
+  const link = links.find((l) => requestedServer && asString(l.server) === requestedServer) || links[0] || {};
   const file = asString(link.link?.file);
   const iframe = asString(link.iframe);
   const chosen = asString(link.server) || requestedServer || "";

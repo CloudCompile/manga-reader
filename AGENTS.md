@@ -89,12 +89,18 @@ body rather than skipping the release.
 - specterscans.com is the first multi-series catalogue. `fetchList` reads the
   series page (`/series/<slug>`); `fetchChapter` accepts either a chapter URL
   or a bare series URL (which it resolves to the newest readable chapter).
-  Page images come from the RSC payload (`"imageUrl"` entries) rather than the
-  `<img>` markup, because lazy pages are not always rendered. Search uses
-  `/api/search?q=`; browse reads `sitemap.xml` (series + covers) joined with
-  `/a-z` for display titles. specterscans.net is the same app under a second
-  host with a different slug set (and images under `cdn.specterscans.net/i/`),
-  so the source matches both hosts and search returns `.net` hits as well.
+  Chapters are addressed by an opaque code: `/series/<slug>/c/<code>`. The
+  series page embeds only its newest 11 chapters plus chapter 1 and a
+  `listToken`, so `fetchList` follows up with
+  `/api/series/<slug>/chapters?page=1&t=<listToken>` for the full list
+  (`/chapter/<num>` URLs are legacy and now 410). Page images come from the RSC
+  payload (`"imageUrl"` entries) rather than the `<img>` markup, because lazy
+  pages are not always rendered. Search uses `/api/search?q=`, whose current
+  response is `{ hits: [...] }` (older `{ results, foreign }` is still read);
+  browse reads `sitemap.xml` (series + covers), since `/a-z` no longer links
+  series. specterscans.net is the same app under a second host with a
+  different slug set (and images under `cdn.specterscans.net/i/`), so the
+  source matches both hosts and search returns `.net` hits as well.
 - allmanga.to is GraphQL (`api.allanime.day`). A **blank search** (`search: {}`)
   returns the newest additions, which is a *recency feed*, not a catalogue: its
   contents change between sessions. There is no working popularity/browse

@@ -48,4 +48,10 @@ export async function run(): Promise<void> {
     assert(!titleMatches(titan, "berserk"), "an unrelated query should not match");
     assert(titleMatches(titan, ""), "an empty query matches everything");
   });
+
+  await test("titleMatches tolerates a doubled-vowel romanisation", () => {
+    const haikyu = t("Haikyu!!", "Ch 402", 408);
+    assert(titleMatches(haikyu, "haikyuu"), "Haikyuu should find the site's Haikyu!!");
+    assert(titleMatches(haikyu, "Haikyu"), "the exact spelling still matches");
+  });
 }

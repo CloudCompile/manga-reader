@@ -832,23 +832,41 @@ function spectreImages(html: string): string[] {
 
 function spectreChapterLinks(html: string, slug: string, base: string): ChapterItem[] {
   if (!slug) return [];
-  // Slugs may contain characters the page entity-encodes inside hrefs
-  // (e.g. "lawyer's" renders as "lawyer&#x27;s").
-  const slugRe = escapeReg(slug).replace(/'/g, "(?:'|&#x27;|&#39;|&apos;)");
-  const re = new RegExp(
-    `href=["'](?:https?://[^"']*)?/series/${slugRe}/chapter/([0-9]+(?:[.-][0-9]+)?)/?["']`,
-    "gi"
-  );
   const map = new Map<number, ChapterItem>();
+
+  // Current payload: the series page serialises its chapter list as
+  // chapters:[{id,number,code,title,…}] and chapters are addressed by an opaque
+  // code (`/series/<slug>/c/<code>`) rather than by number.
+  const payload = /"number\\?":\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*\\?"code\\?":\s*\\?"([^"\\]+)\\?"/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
+  while ((m = payload.exec(html)) !== null) {
     const num = numFromSlug(m[1]);
     if (map.has(num)) continue;
     map.set(num, {
       num,
-      url: spectreUrl(base, `/series/${slug}/chapter/${m[1]}`),
+      url: spectreUrl(base, `/series/${slug}/c/${m[2]}`),
       title: chapterLabel(num, m[1]),
     });
+  }
+
+  // Older captures (and the .net mirror) still link chapters by number.
+  // Slugs may contain characters the page entity-encodes inside hrefs
+  // (e.g. "lawyer's" renders as "lawyer&#x27;s").
+  if (!map.size) {
+    const slugRe = escapeReg(slug).replace(/'/g, "(?:'|&#x27;|&#39;|&apos;)");
+    const re = new RegExp(
+      `href=["'](?:https?://[^"']*)?/series/${slugRe}/chapter/([0-9]+(?:[.-][0-9]+)?)/?["']`,
+      "gi"
+    );
+    while ((m = re.exec(html)) !== null) {
+      const num = numFromSlug(m[1]);
+      if (map.has(num)) continue;
+      map.set(num, {
+        num,
+        url: spectreUrl(base, `/series/${slug}/chapter/${m[1]}`),
+        title: chapterLabel(num, m[1]),
+      });
+    }
   }
   return Array.from(map.values());
 }
@@ -857,15 +875,27 @@ function spectreChapterFromHtml(html: string, url: string): RawChapter {
   const { title, h1 } = pageTitle(html);
   const parsed = parseChapterTitle(h1 || title);
   const slug = spectreSlug(url);
-  const prev = spectreNum(html, "prevNumber");
-  const next = spectreNum(html, "nextNumber");
+  // Older chapter pages carried prevNumber/nextNumber; current ones do not, so
+  // navigation is filled from the series list by scrapeChapter.
+  const prevNum = spectreNum(html, "prevNumber");
+  const nextNum = spectreNum(html, "nextNumber");
+  const prevCode = spectreField(html, "prevCode") || spectreField(html, "prevChapterCode");
+  const nextCode = spectreField(html, "nextCode") || spectreField(html, "nextChapterCode");
   return {
     title,
     mangaName: spectreField(html, "seriesTitle") || parsed.mangaName,
     chapterNum: spectreNum(html, "chapterNumber") || parsed.chapterNum,
     images: spectreImages(html),
-    prevUrl: prev ? spectreUrl(url, `/series/${slug}/chapter/${prev}`) : null,
-    nextUrl: next ? spectreUrl(url, `/series/${slug}/chapter/${next}`) : null,
+    prevUrl: prevCode
+      ? spectreUrl(url, `/series/${slug}/c/${prevCode}`)
+      : prevNum
+        ? spectreUrl(url, `/series/${slug}/chapter/${prevNum}`)
+        : null,
+    nextUrl: nextCode
+      ? spectreUrl(url, `/series/${slug}/c/${nextCode}`)
+      : nextNum
+        ? spectreUrl(url, `/series/${slug}/chapter/${nextNum}`)
+        : null,
   };
 }
 
@@ -881,7 +911,7 @@ const specterscans: Source = {
   async fetchChapter(url): Promise<RawChapter> {
     // A series URL (from search or browse) resolves to its newest readable
     // chapter; the newest entry is sometimes an empty placeholder.
-    if (!/\/chapter\//i.test(url)) {
+    if (!/\/chapter\//i.test(url) && !/\/c\//i.test(url)) {
       const page = await fetchText(url, { referer: originOf(url) });
       const chapters = spectreChapterLinks(page, spectreSlug(url), url).sort((a, b) => b.num - a.num);
       if (!chapters.length) throw new Error("No chapters found for this series.");
@@ -896,10 +926,29 @@ const specterscans: Source = {
   },
   async fetchList(url): Promise<{ chapters: ChapterItem[]; mangaName?: string }> {
     const seriesUrl = spectreSeriesUrl(url);
+    const slug = spectreSlug(seriesUrl);
     const html = await fetchText(seriesUrl, { referer: originOf(seriesUrl) });
-    const chapters = spectreChapterLinks(html, spectreSlug(seriesUrl), seriesUrl);
+    let chapters = spectreChapterLinks(html, slug, seriesUrl);
     const h1 = stripTags(decodeEntities((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || ""));
     const og = decodeEntities((html.match(/<meta property="og:title" content="([^"]*)"/i) || [])[1] || "");
+
+    // The page embeds only the newest handful of chapters (plus chapter 1) and
+    // hands out a listToken for the JSON route that carries the whole list.
+    const token = spectreField(html, "listToken");
+    const total = Number(spectreNum(html, "total")) || 0;
+    if (token && total > chapters.length) {
+      try {
+        const api = await fetchText(
+          `${originOf(seriesUrl)}api/series/${encodeURIComponent(slug)}/chapters?page=1&t=${encodeURIComponent(token)}`,
+          { referer: seriesUrl }
+        );
+        const more = spectreChapterLinks(api, slug, seriesUrl);
+        if (more.length > chapters.length) chapters = more;
+      } catch {
+        /* keep the page's own, shorter list */
+      }
+    }
+
     return { chapters, mangaName: h1 || og || undefined };
   },
   async search(query): Promise<SearchResult[]> {
@@ -907,23 +956,30 @@ const specterscans: Source = {
       referer: `${SPECTRE_ORIGIN}/`,
     });
     const json = JSON.parse(text) as {
+      // Current shape: hits across this site and its .net mirror.
+      hits?: { slug?: string; title?: string; href?: string }[];
+      // Older shape kept for a fallback, in case the endpoint rolls back.
       results?: { slug?: string; title?: string }[];
       foreign?: { href?: string; title?: string }[];
     };
     const out: SearchResult[] = [];
+    const seen = new Set<string>();
+    const add = (title: string | undefined, href: string) => {
+      if (!title || !href || !getSource(href)) return;
+      const key = normalizeUrl(href);
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ title, latestChapter: "", url: href, source: "Spectre Scans" });
+    };
+    for (const r of json.hits || []) {
+      add(r.title, toAbs(r.href || (r.slug ? `/series/${r.slug}` : ""), SPECTRE_ORIGIN));
+    }
     for (const r of json.results || []) {
-      if (!r.slug || !r.title) continue;
-      out.push({
-        title: r.title,
-        latestChapter: "",
-        url: spectreUrl(SPECTRE_ORIGIN, `/series/${r.slug}`),
-        source: "Spectre Scans",
-      });
+      add(r.title, r.slug ? spectreUrl(SPECTRE_ORIGIN, `/series/${r.slug}`) : "");
     }
     // "foreign" entries live on the .net mirror, which this source also reads.
     for (const f of json.foreign || []) {
-      if (!f.href || !f.title || !getSource(f.href)) continue;
-      out.push({ title: f.title, latestChapter: "", url: f.href, source: "Spectre Scans" });
+      add(f.title, f.href || "");
     }
     return out;
   },
@@ -1236,16 +1292,19 @@ export async function scrapeChapter(url: string): Promise<ChapterData> {
   } else if (source.parseChapter) {
     const html = await fetchText(url, { referer: originOf(url) });
     raw = source.parseChapter(html, url);
-    if ((!raw.prevUrl || !raw.nextUrl) && (source.parseList || source.fetchList)) {
-      try {
-        const list = await fetchChapterList(url);
-        fillNavFromList(raw, list.chapters, url);
-      } catch {
-        /* navigation is best-effort */
-      }
-    }
   } else {
     throw new Error("This site is not supported yet.");
+  }
+
+  // Some sources (Specter Scans) no longer put prev/next in the chapter page at
+  // all, so fill them from the series list whichever fetch path was used.
+  if ((!raw.prevUrl || !raw.nextUrl) && (source.parseList || source.fetchList)) {
+    try {
+      const list = await fetchChapterList(url);
+      fillNavFromList(raw, list.chapters, url);
+    } catch {
+      /* navigation is best-effort */
+    }
   }
 
   const data: ChapterData = {
@@ -1537,7 +1596,11 @@ export function titleMatches(t: TitleItem, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
   if (t.title.toLowerCase().includes(q)) return true;
-  return (t.aliases || []).some((a) => a.toLowerCase().includes(q));
+  if ((t.aliases || []).some((a) => a.toLowerCase().includes(q))) return true;
+  // Doubled vowels are a common romanisation difference ("Haikyuu" vs the
+  // site's "Haikyu!!"), so compare a collapsed form as a last resort.
+  const loose = (s: string) => normTitle(s).replace(/([aeiou])\1+/g, "$1");
+  return loose(t.title).includes(loose(q));
 }
 
 // The home shelf: the hand-picked Spectre titles in CURATED_TITLES order, plus
@@ -1829,7 +1892,7 @@ export const HEALTH_PROBES: HealthProbe[] = [
   { id: "dandadana", url: "https://dandadana.com/manga/dandadan-chapter-248/" },
   { id: "oshino", url: "https://readoshino.com/manga/oshi-no-ko-chapter-166/" },
   { id: "chainsawman", url: "https://onlinechainsawmanmanga.us/chainsaw-man-chapter-2/" },
-  { id: "specterscans", url: "https://specterscans.com/series/boku-no-kokoro-no-yabai-yatsu/chapter/199" },
+  { id: "specterscans", url: "https://specterscans.com/series/haikyu/c/c2w2sv2j8w3h0" },
 ];
 
 export interface HealthResult {
@@ -1873,8 +1936,15 @@ export async function checkAnimeApiHealth(): Promise<HealthResult> {
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) return { id: "anime-api", url, ok: false, images: 0, error: `HTTP ${res.status}` };
-    const json = (await res.json()) as { results?: { data?: unknown[] } };
-    const count = Array.isArray(json.results?.data) ? json.results.data.length : 0;
+    const json = (await res.json()) as {
+      results?: { data?: unknown[]; sources?: { results?: unknown[] }[] };
+    };
+    const count =
+      (Array.isArray(json.results?.data) ? json.results.data.length : 0) +
+      (json.results?.sources || []).reduce(
+        (n, s) => n + (Array.isArray(s?.results) ? s.results.length : 0),
+        0
+      );
     return {
       id: "anime-api",
       url,

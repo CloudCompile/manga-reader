@@ -33,6 +33,26 @@ export async function run(): Promise<void> {
     assertEqual(r!.subEpisodes, "220", "sub episode count");
   });
 
+  await test("parseSearchItem reads the provider shape too", () => {
+    // The search endpoint now returns camelCase fields and top-level counts.
+    const r = parseSearchItem({
+      id: "13383",
+      slug: "boruto-naruto-next-generations",
+      title: "Boruto: Naruto Next Generations",
+      japaneseTitle: "Boruto",
+      poster: "https://cdn/x.jpg",
+      type: "TV",
+      subEpisodes: 293,
+      dubEpisodes: 293,
+    });
+    assertEqual(r!.japaneseTitle, "Boruto", "camelCase japanese title");
+    assertEqual(r!.showType, "TV", "the provider's type field");
+    assertEqual(r!.subEpisodes, "293", "top-level sub count");
+    assertEqual(r!.dubEpisodes, "293", "top-level dub count");
+    // The info/episodes routes need the canonical `<slug>-<dataId>` id.
+    assertEqual(r!.id, "boruto-naruto-next-generations-13383", "provider id should be canonicalised");
+  });
+
   await test("parseSearchItem drops an item with no id or title", () => {
     assertEqual(parseSearchItem({ title: "No id" }), null, "missing id should drop the item");
     assertEqual(parseSearchItem({ id: "x" }), null, "missing title should drop the item");
@@ -110,6 +130,23 @@ export async function run(): Promise<void> {
     const s = parseStream({ streamingLink: { iframe: "https://embed/x" } });
     assertEqual(s!.kind, "iframe", "the iframe is the only option");
     assertEqual(s!.url, "https://embed/x", "iframe url");
+  });
+
+  await test("parseStream reads the per-server link list", () => {
+    // The API now returns streamingLink as an array, one entry per server.
+    const s = parseStream(
+      {
+        streamingLink: [
+          { server: "hd-1", link: { file: "https://cdn/low.m3u8" } },
+          { server: "hd-2", link: { file: "https://cdn/high.m3u8" } },
+        ],
+        servers: [{ type: "sub", server_name: "hd-2" }],
+      },
+      "hd-2"
+    );
+    assertEqual(s!.url, "https://cdn/high.m3u8", "the requested server should win");
+    assertEqual(s!.servers.length, 1, "the snake_case server name should still parse");
+    assertEqual(s!.servers[0].name, "hd-2", "server name");
   });
 
   await test("parseStream reports an empty playlist when nothing is playable", () => {

@@ -167,4 +167,32 @@ export async function run(): Promise<void> {
     assert(Math.max(...nums) === 199, `newest chapter should be 199, got ${Math.max(...nums)}`);
     assert(Math.min(...nums) === 1, `oldest chapter should be 1, got ${Math.min(...nums)}`);
   });
+
+  // Specter Scans replaced number-addressed chapter URLs with opaque codes
+  // (`/series/<slug>/c/<code>`), which broke every catalogue entry at once.
+  await test("specterscans reads the code-addressed chapter payload", () => {
+    const chapterUrl = "https://specterscans.com/series/haikyu/c/f9pc7231795sk";
+    const source = getSource(chapterUrl);
+    assertEqual(source!.id, "specterscans", "wrong source matched");
+    const parsed = source!.parseChapter!(read("spectre-chapter-current.html"), chapterUrl);
+    assertEqual(parsed.images.length, 17, "expected 17 page images");
+    assert(parsed.images[0].endsWith("/ch-000402.3/001.png"), `unexpected first page: ${parsed.images[0]}`);
+    assertEqual(parsed.chapterNum, "402.3", "chapter number should come from the payload");
+    assertEqual(parsed.mangaName, "Haikyu!!", "series name should come from the payload");
+
+    // The page itself now carries only the newest eleven chapters; the full
+    // list comes from the token-protected JSON route, captured here.
+    const seriesUrl = "https://specterscans.com/series/haikyu";
+    const initial = source!.parseList!(read("spectre-series-current.html"), seriesUrl);
+    assertEqual(initial.length, 11, "the page should carry its newest slice");
+    const items = source!.parseList!(read("spectre-chapters-current.json"), seriesUrl);
+    assertEqual(items.length, 408, `expected the full chapter list, got ${items.length}`);
+    const newest = items.reduce((a, b) => (a.num > b.num ? a : b));
+    assertEqual(newest.num, 402.3, "newest chapter should be 402.3");
+    assert(
+      newest.url.startsWith("https://specterscans.com/series/haikyu/c/"),
+      `chapter URLs should use the code route, got ${newest.url}`
+    );
+    assert(items.every((c) => c.url.includes("/c/")), "every chapter should have a resolvable code URL");
+  });
 }
