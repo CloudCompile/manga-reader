@@ -14,6 +14,7 @@ export const dynamic = "force-dynamic";
 async function handler(req: NextRequest) {
   const params = req.nextUrl.searchParams;
   const explicitId = (params.get("id") || "").trim();
+  const explicitProvider = (params.get("provider") || "").trim() || undefined;
   const title = (params.get("title") || "").trim();
   const aliases = (params.get("aliases") || "")
     .split("|")
@@ -23,6 +24,7 @@ async function handler(req: NextRequest) {
 
   try {
     let id = explicitId;
+    let provider = explicitProvider;
     let matchScore: number | undefined;
     let alternatives: Awaited<ReturnType<typeof searchAnime>> = [];
 
@@ -36,10 +38,16 @@ async function handler(req: NextRequest) {
         return NextResponse.json({ matched: false, title, alternatives });
       }
       id = match.anime.id;
+      // A provider hit belongs to its own host; reading it through /api/info
+      // would look up an id that host never issued.
+      provider = match.anime.provider;
       matchScore = match.score;
     }
 
-    const [info, episodes] = await Promise.all([animeInfo(id), animeEpisodes(id)]);
+    const [info, episodes] = await Promise.all([
+      animeInfo(id, provider),
+      animeEpisodes(id, provider),
+    ]);
     if (!info) return NextResponse.json({ error: "Anime not found" }, { status: 404 });
 
     return NextResponse.json({ matched: true, score: matchScore, anime: info, episodes });

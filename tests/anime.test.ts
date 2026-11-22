@@ -5,6 +5,8 @@
 import {
   parseSearchItem,
   parseAnimeInfo,
+  parseProviderAnime,
+  parseProviderEpisodes,
   parseEpisodes,
   parseStream,
   titleSimilarity,
@@ -49,8 +51,48 @@ export async function run(): Promise<void> {
     assertEqual(r!.showType, "TV", "the provider's type field");
     assertEqual(r!.subEpisodes, "293", "top-level sub count");
     assertEqual(r!.dubEpisodes, "293", "top-level dub count");
-    // The info/episodes routes need the canonical `<slug>-<dataId>` id.
-    assertEqual(r!.id, "boruto-naruto-next-generations-13383", "provider id should be canonicalised");
+    // Provider ids stay host-local; they are read back through that provider.
+    assertEqual(r!.id, "13383", "provider id should stay untouched");
+  });
+
+  await test("parseProviderAnime maps the provider detail shape", () => {
+    const info = parseProviderAnime(
+      {
+        id: "30952",
+        title: "One Piece Log: Fish-Man Island Saga",
+        japaneseTitle: "One Piece: Gyojin Tou-hen",
+        description: "Two years after the Summit War.",
+        type: "TV",
+        rating: "PG-13",
+        episodes: 4,
+        subEpisodes: 4,
+        genres: ["Action", "Adventure"],
+        studios: ["Toei Animation"],
+      },
+      "30952"
+    );
+    assertEqual(info!.title, "One Piece Log: Fish-Man Island Saga", "title");
+    assertEqual(info!.showType, "TV", "type");
+    assertEqual(info!.overview, "Two years after the Summit War.", "description");
+    assertEqual(info!.genres.join(","), "Action,Adventure", "genres");
+    assertEqual(info!.studios.join(","), "Toei Animation", "studios");
+    assertEqual(info!.episodes, "4", "episode count");
+    assertEqual(info!.adult, false, "PG-13 is not adult");
+  });
+
+  await test("parseProviderEpisodes sorts and tags the provider", () => {
+    const eps = parseProviderEpisodes(
+      [
+        { id: "30955", number: 2, title: "Episode 2" },
+        { id: "30954", number: 1 },
+        { number: 3 },
+      ],
+      "aniwatchtv"
+    );
+    assertEqual(eps.length, 2, "the id-less row should be dropped");
+    assertEqual(eps[0].num, 1, "sorted ascending");
+    assertEqual(eps[0].title, "Episode 1", "a missing title is synthesised");
+    assertEqual(eps[0].provider, "aniwatchtv", "provider is attached for the stream route");
   });
 
   await test("parseSearchItem drops an item with no id or title", () => {
@@ -149,6 +191,16 @@ export async function run(): Promise<void> {
     assertEqual(s!.servers[0].name, "hd-2", "server name");
   });
 
+  await test("parseStream forwards the manifest referer", () => {
+    const s = parseStream({
+      streamingLink: {
+        link: { file: "https://cdn/master.m3u8" },
+        headers: { Referer: "https://megaplay.buzz/" },
+      },
+    });
+    assertEqual(s!.referer, "https://megaplay.buzz/", "the CDN referer must survive");
+  });
+
   await test("parseStream reports an empty playlist when nothing is playable", () => {
     const s = parseStream({ streamingLink: {} });
     assertEqual(s!.kind, "hls", "the shape stays consistent");
@@ -191,6 +243,14 @@ export async function run(): Promise<void> {
     assert(out.includes("URI=\"/api/anime/hls?url="), "the key URI is relayed");
     assert(out.includes("/api/anime/hls?url=https%3A%2F%2Fcdn%2Fpath%2Fseg1.ts"), "a relative segment resolves against the playlist");
     assert(out.includes("/api/anime/hls?url=https%3A%2F%2Fcdn%2Fabs%2Fseg2.ts"), "an absolute segment is relayed");
+  });
+
+  await test("rewritePlaylist keeps the referer on every child request", () => {
+    const out = rewritePlaylist("#EXTM3U\nseg1.ts", "https://cdn/path/master.m3u8", "/api/anime/hls", "https://megaplay.buzz/");
+    assert(
+      out.includes("&ref=https%3A%2F%2Fmegaplay.buzz%2F"),
+      `segment should carry the referer, got: ${out}`
+    );
   });
 
   await test("isPlaylist reads the body, not the content type", () => {

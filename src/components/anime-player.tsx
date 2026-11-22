@@ -28,7 +28,8 @@ import {
 import { getAnimeRotate, setAnimeRotate } from "@/lib/storage";
 import type { AnimeEpisode, AnimeServer, AnimeStream } from "@/lib/anime";
 
-const RELAY = (url: string) => `/api/anime/hls?url=${encodeURIComponent(url)}`;
+const RELAY = (url: string, referer?: string) =>
+  `/api/anime/hls?url=${encodeURIComponent(url)}${referer ? `&ref=${encodeURIComponent(referer)}` : ""}`;
 
 interface AnimePlayerProps {
   title: string;
@@ -116,6 +117,7 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
     setStream(null);
     const params = new URLSearchParams({ id: episode.id });
     if (server) params.set("server", server);
+    if (episode.provider) params.set("provider", episode.provider);
     fetch(`/api/anime/stream?${params.toString()}`)
       .then(async (res) => {
         const json = await res.json();
@@ -139,7 +141,7 @@ export default function AnimePlayer({ title, episodes, startIndex, isDark, onClo
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !stream || stream.kind !== "hls" || !stream.url) return;
-    const src = RELAY(stream.url);
+    const src = RELAY(stream.url, stream.referer);
 
     const attachNative = () => {
       video.src = src;

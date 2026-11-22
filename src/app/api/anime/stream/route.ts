@@ -12,10 +12,11 @@ export const dynamic = "force-dynamic";
 async function handler(req: NextRequest) {
   const id = (req.nextUrl.searchParams.get("id") || "").trim();
   const server = (req.nextUrl.searchParams.get("server") || "").trim() || undefined;
+  const provider = (req.nextUrl.searchParams.get("provider") || "").trim() || undefined;
   if (!id) return NextResponse.json({ error: "id param required" }, { status: 400 });
 
   try {
-    const stream = await animeStream(id, server);
+    const stream = await animeStream(id, server, provider);
     if (!stream || (!stream.url && !stream.servers.length)) {
       return NextResponse.json({ error: "No stream available for this episode" }, { status: 404 });
     }

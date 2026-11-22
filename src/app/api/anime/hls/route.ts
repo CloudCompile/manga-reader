@@ -58,7 +58,7 @@ export async function GET(req: NextRequest) {
     // inspected rather than the Content-Type.
     const head = new TextDecoder().decode(buf.slice(0, 4096));
     if (isPlaylist(head, contentType)) {
-      const body = rewritePlaylist(new TextDecoder().decode(buf), target.href);
+      const body = rewritePlaylist(new TextDecoder().decode(buf), target.href, "/api/anime/hls", referer);
       return new NextResponse(body, {
         headers: {
           "Content-Type": "application/vnd.apple.mpegurl",

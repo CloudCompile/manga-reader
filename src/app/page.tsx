@@ -976,7 +976,7 @@ export default function MangaReader() {
   // Resolves the open manga to an anime. `id` skips the title match and loads a
   // specific entry, which is what the picker uses when the reader chooses a
   // different hit from the search results.
-  const loadAnime = useCallback(async (id?: string) => {
+  const loadAnime = useCallback(async (id?: string, provider?: string) => {
     setShowAnime(true);
     setAnimeLoading(true);
     setAnimeError("");
@@ -986,6 +986,8 @@ export default function MangaReader() {
       const params = new URLSearchParams();
       if (id) params.set("id", id);
       else params.set("title", title);
+      // Search hits carry the host they came from; ids are not portable.
+      if (id && provider) params.set("provider", provider);
       // Aliases from the detail lookup (romaji, translated names) give the
       // matcher more to work with; the cache makes that lookup free when the
       // reader already opened the details panel.
@@ -1557,7 +1559,7 @@ export default function MangaReader() {
                 </p>
               )}
               {picks.map((r) => (
-                <button key={r.id} onClick={() => loadAnime(r.id)}
+                <button key={`${r.provider || "native"}:${r.id}`} onClick={() => loadAnime(r.id, r.provider)}
                   className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left text-sm transition-colors ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
                   {r.poster && <img src={PROXY(r.poster)} alt="" className="w-8 rounded object-cover shrink-0" style={{ aspectRatio: "2/3" }} />}
                   <span className="min-w-0">

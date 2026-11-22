@@ -9,10 +9,11 @@ export const dynamic = "force-dynamic";
 // back rather than rebuilding it.
 async function handler(req: NextRequest) {
   const id = (req.nextUrl.searchParams.get("id") || "").trim();
+  const provider = (req.nextUrl.searchParams.get("provider") || "").trim() || undefined;
   if (!id) return NextResponse.json({ error: "id param required" }, { status: 400 });
 
   try {
-    const episodes = await animeEpisodes(id);
+    const episodes = await animeEpisodes(id, provider);
     return NextResponse.json({ id, episodes });
   } catch (err) {
     console.error("Anime episodes error:", err);

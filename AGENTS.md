@@ -156,6 +156,19 @@ returns is parsed defensively (`parseSearchItem`, `parseAnimeInfo`,
 shallow and loosely typed — an unrecognised shape yields "no match", never a
 throw.
 
+- Search results are multi-provider: the native list is `data`, and every other
+  host is reported under `sources[].results`. Provider ids are host-local and
+  are **not** portable, so `searchAnime` tags those hits with `provider` and
+  `animeInfo`/`animeEpisodes`/`animeStream` read them through
+  `/api/providers/<provider>/{anime,episodes,servers,stream}`. Native
+  `aniwaves` hits keep using `/api/info`, `/api/episodes/:id` and
+  `/api/stream`. Never rewrite a provider id into a native one.
+- Provider streams return `headers.Referer` (currently `megaplay.buzz`). The
+  player passes it to `/api/anime/hls` as `ref`, and `rewritePlaylist` copies it
+  onto every rewritten child URI; the manifest CDN answers 403 without it. The
+  first advertised server is usually embed-only, so `animeStream` retries
+  `HD-1`/`HD-2`/`Vidstream-2` when no server was chosen and the default has no
+  direct manifest.
 - Matching a manga to an anime is `findAnimeMatch`, by normalised title overlap
   (`titleSimilarity`, with a whole-word prefix boost and a leading-article
   strip). It needs a score of 0.6+; below that `/api/anime/watch` returns

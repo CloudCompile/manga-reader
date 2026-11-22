@@ -22,6 +22,10 @@ export interface AnimeSearchResult {
   // sends "?" for an ongoing series.
   subEpisodes?: string;
   dubEpisodes?: string;
+  // The streaming host this hit came from. Ids are not portable between hosts,
+  // so a hit with a provider is read and streamed through
+  // /api/providers/<provider>/… rather than the native /api/info route.
+  provider?: string;
 }
 
 export interface AnimeInfo {
@@ -46,13 +50,16 @@ export interface AnimeInfo {
 }
 
 export interface AnimeEpisode {
-  // Opaque id the stream endpoint expects; already carries the "?ep=" suffix.
+  // Opaque id the stream endpoint expects; already carries the "?ep=" suffix on
+  // the native source, and is the host's own episode id on a provider.
   id: string;
   num: number;
   title: string;
   filler: boolean;
   subbed: boolean;
   dubbed: boolean;
+  // Present when the episode belongs to a provider rather than the native API.
+  provider?: string;
 }
 
 export interface AnimeServer {
@@ -68,6 +75,9 @@ export interface AnimeStream {
   url: string;
   server: string;
   servers: AnimeServer[];
+  // The player origin the manifest CDN requires. Sent to /api/anime/hls so the
+  // relay and every child request keep it; the CDN answers 403 without it.
+  referer?: string;
 }
 
 // ─── Fetch plumbing ───────────────────────────────────────
@@ -163,14 +173,9 @@ export interface RawSearchItem {
 }
 
 export function parseSearchItem(raw: RawSearchItem): AnimeSearchResult | null {
-  const rawId = asString(raw.id);
+  const id = asString(raw.id);
   const title = asString(raw.title);
-  if (!rawId || !title) return null;
-  // A provider hit carries a numeric id plus a slug; the info and episodes
-  // routes take the canonical `<slug>-<dataId>` form. Canonical hits already
-  // arrive in that form and are left alone.
-  const slug = asString(raw.slug);
-  const id = slug && /^[0-9]+$/.test(rawId) ? `${slug}-${rawId}` : rawId;
+  if (!id || !title) return null;
   return {
     id,
     title,
@@ -187,24 +192,35 @@ export function parseSearchItem(raw: RawSearchItem): AnimeSearchResult | null {
 // shapes so a provider rollback does not empty the picker again.
 interface RawSearchResults {
   data?: RawSearchItem[];
-  sources?: { results?: RawSearchItem[] }[];
+  sources?: { provider?: unknown; results?: RawSearchItem[] }[];
 }
 
 export async function searchAnime(query: string): Promise<AnimeSearchResult[]> {
   const q = query.trim();
   if (!q) return [];
   const results = await apiGet<RawSearchResults>("search", { keyword: q });
-  const items: RawSearchItem[] = [];
-  if (Array.isArray(results?.data)) items.push(...results.data);
-  for (const source of results?.sources || []) {
-    if (Array.isArray(source?.results)) items.push(...source.results);
+  const items: { item: RawSearchItem; provider?: string }[] = [];
+  if (Array.isArray(results?.data)) {
+    for (const item of results.data) items.push({ item });
   }
+  for (const source of results?.sources || []) {
+    if (!Array.isArray(source?.results)) continue;
+    const provider = asString(source.provider);
+    for (const item of source.results) {
+      items.push({ item, provider: provider && provider !== "aniwaves" ? provider : undefined });
+    }
+  }
+  // The same show can appear on several hosts with different ids, so the key
+  // includes the provider: both entries stay selectable.
   const seen = new Set<string>();
   const out: AnimeSearchResult[] = [];
-  for (const item of items) {
+  for (const { item, provider } of items) {
     const parsed = parseSearchItem(item);
-    if (!parsed || seen.has(parsed.id)) continue;
-    seen.add(parsed.id);
+    if (!parsed) continue;
+    if (provider) parsed.provider = provider;
+    const key = `${provider || "native"}:${parsed.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(parsed);
   }
   return out;
@@ -263,7 +279,80 @@ export function parseAnimeInfo(raw: unknown, fallbackId = ""): AnimeInfo | null 
   };
 }
 
-export async function animeInfo(id: string): Promise<AnimeInfo | null> {
+// Every provider action returns `{ provider, action, data, total }`; the useful
+// part is `data`.
+interface ProviderEnvelope<T> {
+  provider?: string;
+  action?: string;
+  data?: T;
+  total?: number;
+}
+
+async function providerGet<T>(
+  provider: string,
+  action: string,
+  params: Record<string, string | undefined>
+): Promise<T | null> {
+  const result = await apiGet<ProviderEnvelope<T>>(
+    `providers/${encodeURIComponent(provider)}/${action}`,
+    params
+  );
+  return result && result.data !== undefined ? result.data : null;
+}
+
+// The streaming providers expose a flatter detail object than `/api/info`'s
+// `animeInfo` block, so it is mapped separately.
+export interface RawProviderAnime {
+  id?: unknown;
+  slug?: unknown;
+  title?: unknown;
+  japaneseTitle?: unknown;
+  poster?: unknown;
+  description?: unknown;
+  type?: unknown;
+  rating?: unknown;
+  status?: unknown;
+  score?: unknown;
+  aired?: unknown;
+  duration?: unknown;
+  episodes?: unknown;
+  subEpisodes?: unknown;
+  dubEpisodes?: unknown;
+  genres?: unknown;
+  studios?: unknown;
+  producers?: unknown;
+}
+
+export function parseProviderAnime(raw: RawProviderAnime, fallbackId = ""): AnimeInfo | null {
+  const title = asString(raw.title);
+  if (!title) return null;
+  const rating = asString(raw.rating) || "";
+  return {
+    id: asString(raw.id) || fallbackId,
+    title,
+    japaneseTitle: asString(raw.japaneseTitle),
+    poster: asString(raw.poster),
+    showType: asString(raw.type),
+    overview: asString(raw.description),
+    status: asString(raw.status),
+    score: asString(raw.score),
+    duration: asString(raw.duration),
+    episodes: asString(raw.episodes),
+    dateAired: asString(raw.aired),
+    studios: asStringList(raw.studios),
+    producers: asStringList(raw.producers),
+    genres: asStringList(raw.genres),
+    subEpisodes: asString(raw.subEpisodes),
+    dubEpisodes: asString(raw.dubEpisodes),
+    adult: /(^|\b)(R\+|R17|Rx)(\b|$)/i.test(rating),
+  };
+}
+
+export async function animeInfo(id: string, provider?: string): Promise<AnimeInfo | null> {
+  if (provider) {
+    const raw = await providerGet<RawProviderAnime>(provider, "anime", { id });
+    return raw ? parseProviderAnime(raw, id) : null;
+  }
   const result = await apiGet<{ data?: unknown }>("info", { id });
   return parseAnimeInfo(result?.data, id);
 }
@@ -299,7 +388,43 @@ export function parseEpisodes(raw: unknown): AnimeEpisode[] {
   return out;
 }
 
-export async function animeEpisodes(id: string): Promise<AnimeEpisode[]> {
+export interface RawProviderEpisode {
+  id?: unknown;
+  number?: unknown;
+  title?: unknown;
+  japaneseTitle?: unknown;
+  slug?: unknown;
+}
+
+// Provider episode ids are opaque host-local strings (numeric on the
+// otakuthemes hosts), not the native `"<animeId>?ep=<id>_<n>"` form, so they
+// are passed back to the provider's stream route verbatim.
+export function parseProviderEpisodes(raw: unknown, provider: string): AnimeEpisode[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AnimeEpisode[] = [];
+  for (const row of raw as RawProviderEpisode[]) {
+    const id = asString(row.id);
+    const num = typeof row.number === "number" ? row.number : Number(asString(row.number));
+    if (!id || !isFinite(num)) continue;
+    out.push({
+      id,
+      num,
+      title: asString(row.title) || `Episode ${num}`,
+      filler: false,
+      subbed: true,
+      dubbed: false,
+      provider,
+    });
+  }
+  out.sort((a, b) => a.num - b.num);
+  return out;
+}
+
+export async function animeEpisodes(id: string, provider?: string): Promise<AnimeEpisode[]> {
+  if (provider) {
+    const rows = await providerGet<unknown>(provider, "episodes", { id });
+    return parseProviderEpisodes(rows, provider);
+  }
   // `episodes/<id>` takes the id in the path, not as a query parameter.
   const result = await apiGetPath<{ episodes?: unknown }>(`episodes/${encodeURIComponent(id)}`);
   return parseEpisodes(result?.episodes);
@@ -311,6 +436,7 @@ interface RawStreamLink {
   iframe?: unknown;
   link?: { file?: unknown; type?: unknown };
   server?: unknown;
+  headers?: unknown;
 }
 
 export interface RawStream {
@@ -337,15 +463,93 @@ export function parseStream(result: unknown, requestedServer?: string): AnimeStr
   const file = asString(link.link?.file);
   const iframe = asString(link.iframe);
   const chosen = asString(link.server) || requestedServer || "";
+  const headers = (link.headers ?? {}) as Record<string, unknown>;
+  const referer = asString(headers.Referer) || asString(headers.referer);
   // Prefer the relayable playlist; the iframe is only used when the upstream
   // gave us nothing else, since embedding an unknown third party is a worse
   // experience (ads, no quality control, and it can refuse to frame).
-  if (file) return { kind: "hls", url: file, server: chosen, servers };
-  if (iframe) return { kind: "iframe", url: iframe, server: chosen, servers };
+  if (file) return { kind: "hls", url: file, server: chosen, servers, ...(referer ? { referer } : {}) };
+  if (iframe) return { kind: "iframe", url: iframe, server: chosen, servers, ...(referer ? { referer } : {}) };
   return { kind: "hls", url: "", server: chosen, servers };
 }
 
-export async function animeStream(episodeId: string, server?: string): Promise<AnimeStream | null> {
+interface RawProviderServer {
+  type?: unknown;
+  name?: unknown;
+  serverName?: unknown;
+}
+
+interface RawProviderStream {
+  server?: unknown;
+  iframe?: unknown;
+  link?: { file?: unknown; type?: unknown };
+  headers?: Record<string, unknown> | unknown;
+}
+
+// Host-local server lists, used both for the player's server picker and to
+// retry when the default server only offers an embed.
+function parseProviderServers(raw: unknown): AnimeServer[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AnimeServer[] = [];
+  for (const row of raw as RawProviderServer[]) {
+    const name = asString(row.name) || asString(row.serverName);
+    if (!name || out.some((s) => s.name === name)) continue;
+    out.push({ type: asString(row.type) || "sub", name });
+  }
+  return out;
+}
+
+function parseProviderStream(raw: RawProviderStream, servers: AnimeServer[]): AnimeStream {
+  const file = asString(raw.link?.file);
+  const iframe = asString(raw.iframe);
+  const headers = (raw.headers ?? {}) as Record<string, unknown>;
+  const referer = asString(headers.Referer) || asString(headers.referer);
+  return {
+    kind: file ? "hls" : "iframe",
+    url: file || iframe || "",
+    server: asString(raw.server) || "",
+    servers,
+    ...(referer ? { referer } : {}),
+  };
+}
+
+// The first server these hosts advertise is usually an embed-only player, so a
+// request without an explicit server retries these known HLS-capable names.
+const PROVIDER_HLS_SERVERS = ["HD-1", "HD-2", "Vidstream-2"];
+
+export async function animeStream(
+  episodeId: string,
+  server?: string,
+  provider?: string
+): Promise<AnimeStream | null> {
+  if (provider) {
+    const serverRows = await providerGet<unknown>(provider, "servers", { id: episodeId }).catch(
+      () => null
+    );
+    const servers = parseProviderServers(serverRows);
+    const load = async (name?: string): Promise<AnimeStream | null> => {
+      const raw = await providerGet<RawProviderStream>(provider, "stream", {
+        id: episodeId,
+        server: name,
+        type: "sub",
+      });
+      return raw ? parseProviderStream(raw, servers) : null;
+    };
+
+    let result = await load(server);
+    if (!result) return null;
+    if (!server && result.kind !== "hls") {
+      for (const name of PROVIDER_HLS_SERVERS) {
+        const alt = await load(name).catch(() => null);
+        if (alt && alt.kind === "hls" && alt.url) {
+          result = alt;
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
   const result = await apiGet<RawStream>("stream", { id: episodeId, server });
   return parseStream(result, server);
 }
@@ -431,12 +635,20 @@ export async function findAnimeMatch(
 
 const URI_ATTR = /URI="([^"]+)"/;
 
-function rewriteUri(uri: string, base: string, proxyPath: string): string {
+function rewriteUri(uri: string, base: string, proxyPath: string, referer?: string): string {
   const abs = new URL(uri, base).href;
-  return `${proxyPath}?url=${encodeURIComponent(abs)}`;
+  // Child requests must keep the referer: the CDN rejects a segment fetched
+  // without it, and each rewritten URI is a separate request to the relay.
+  const suffix = referer ? `&ref=${encodeURIComponent(referer)}` : "";
+  return `${proxyPath}?url=${encodeURIComponent(abs)}${suffix}`;
 }
 
-export function rewritePlaylist(body: string, base: string, proxyPath = "/api/anime/hls"): string {
+export function rewritePlaylist(
+  body: string,
+  base: string,
+  proxyPath = "/api/anime/hls",
+  referer?: string
+): string {
   const out: string[] = [];
   for (const line of body.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -448,11 +660,11 @@ export function rewritePlaylist(body: string, base: string, proxyPath = "/api/an
       // EXT-X-KEY / EXT-X-MAP carry a URI attribute that also has to be relayed,
       // otherwise a keyed stream fails to decrypt through the proxy.
       const m = trimmed.match(URI_ATTR);
-      if (m) out.push(trimmed.replace(URI_ATTR, `URI="${rewriteUri(m[1], base, proxyPath)}"`));
+      if (m) out.push(trimmed.replace(URI_ATTR, `URI="${rewriteUri(m[1], base, proxyPath, referer)}"`));
       else out.push(trimmed);
       continue;
     }
-    out.push(rewriteUri(trimmed, base, proxyPath));
+    out.push(rewriteUri(trimmed, base, proxyPath, referer));
   }
   return out.join("\n");
 }

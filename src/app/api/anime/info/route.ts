@@ -7,10 +7,11 @@ export const dynamic = "force-dynamic";
 // Full metadata for one anime, by the id returned from a search.
 async function handler(req: NextRequest) {
   const id = (req.nextUrl.searchParams.get("id") || "").trim();
+  const provider = (req.nextUrl.searchParams.get("provider") || "").trim() || undefined;
   if (!id) return NextResponse.json({ error: "id param required" }, { status: 400 });
 
   try {
-    const info = await animeInfo(id);
+    const info = await animeInfo(id, provider);
     if (!info) return NextResponse.json({ error: "Anime not found" }, { status: 404 });
     return NextResponse.json(info);
   } catch (err) {
