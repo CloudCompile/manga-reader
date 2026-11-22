@@ -62,8 +62,8 @@ function clearCookies(): void {
   }
 }
 
-function entry(url: string, chapter: string, name: string, page?: number) {
-  return { url, mangaName: name, chapterNum: chapter, timestamp: Date.now(), page };
+function entry(url: string, chapter: string, name: string, page?: number, pages?: number) {
+  return { url, mangaName: name, chapterNum: chapter, timestamp: Date.now(), page, pages };
 }
 
 // Imports a second, independent copy of the storage module so its one-time
@@ -95,6 +95,25 @@ export async function run(): Promise<void> {
     storage.pushHistory(entry(`${FFB}/the-fragrant-flower-blooms-with-dignity-manga-chapter-191/`, "191", LONG_NAME));
     const found = storage.getHistory().find((h) => h.chapterNum === "191");
     assertEqual(found?.page, 7, "page should be carried over");
+  });
+
+  await test("page total and the latest page survive for continue reading", async () => {
+    const url = `${FFB}/the-fragrant-flower-blooms-with-dignity-manga-chapter-192/`;
+    storage.pushHistory(entry(url, "192", LONG_NAME, 4, 17));
+    let found = storage.getHistory().find((h) => h.url === url);
+    assertEqual(found?.pages, 17, "the chapter page total should survive");
+
+    // Continue reading resumes the page the reader is actually on, so moving
+    // backwards must lower the stored page instead of keeping the furthest one.
+    storage.setPage(url, 2, 17);
+    found = storage.getHistory().find((h) => h.url === url);
+    assertEqual(found?.page, 2, "the latest page should replace the furthest page");
+    assertEqual(found?.pages, 17, "updating the page should keep the total");
+
+    const reload = await freshStorage("page-progress-reload");
+    const persisted = reload.getHistory().find((h) => h.url === url);
+    assertEqual(persisted?.page, 2, "the resume page should survive a reload");
+    assertEqual(persisted?.pages, 17, "the page total should survive a reload");
   });
 
   await test("30 long-URL entries still fit one cookie", () => {

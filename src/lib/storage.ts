@@ -26,6 +26,8 @@ export interface HistoryEntry {
   timestamp: number;
   // Last page reached in this chapter, so the reader can resume where it left.
   page?: number;
+  // Total pages in the chapter, so the continue card can show real progress.
+  pages?: number;
 }
 
 export type FitMode = "width" | "height" | "original";
@@ -72,6 +74,7 @@ interface PackedEntry {
   c?: string;
   t: number;
   p?: number;
+  g?: number;
 }
 
 interface PackedGroup {
@@ -158,6 +161,10 @@ function parseEntry(h: unknown): HistoryEntry | null {
     chapterNum: typeof e.chapterNum === "string" ? e.chapterNum : "",
     timestamp: e.timestamp,
     page: typeof e.page === "number" ? e.page : undefined,
+    pages:
+      typeof e.pages === "number" && isFinite(e.pages) && e.pages > 0
+        ? Math.round(e.pages)
+        : undefined,
   };
 }
 
@@ -177,6 +184,7 @@ function unpackEntries(
       chapterNum: typeof e.c === "string" ? e.c : "",
       timestamp: e.t,
       page: typeof e.p === "number" ? e.p : undefined,
+      pages: typeof e.g === "number" && e.g > 0 ? e.g : undefined,
     });
   }
   return out;
@@ -355,6 +363,7 @@ function packGroup(entries: HistoryEntry[], lastRead: string | null, key: "h" | 
     if (e.mangaName) out.n = indexOfTitle(e.mangaName);
     if (e.chapterNum) out.c = e.chapterNum;
     if (typeof e.page === "number") out.p = e.page;
+    if (typeof e.pages === "number") out.g = e.pages;
     return out;
   });
 
@@ -458,7 +467,12 @@ export function pushHistory(entry: HistoryEntry): HistoryEntry[] {
   // Re-opening a chapter must not discard the page already reached in it.
   const existing = state.history.find((e) => e.url === entry.url);
   const history = state.history.filter((e) => e.url !== entry.url);
-  history.unshift({ ...entry, page: entry.page ?? existing?.page, timestamp: Date.now() });
+  history.unshift({
+    ...entry,
+    page: entry.page ?? existing?.page,
+    pages: entry.pages ?? existing?.pages,
+    timestamp: Date.now(),
+  });
   const next = { ...state, history };
   persist(next);
   return next.history;
@@ -556,10 +570,14 @@ export function setAnimeRotate(animeRotate: boolean): void {
   persist({ ...state, animeRotate });
 }
 
-// Records how far into a chapter the reader got, so it can resume later.
-export function setPage(url: string, page: number): void {
+// Records the page the reader is on now (not the furthest page reached), so
+// "continue reading" resumes their actual last position. `pages` is stored too
+// when known, which is what lets the card show a real progress bar.
+export function setPage(url: string, page: number, pages?: number): void {
   const state = loadState();
-  const history = state.history.map((h) => (h.url === url ? { ...h, page } : h));
+  const history = state.history.map((h) =>
+    h.url === url ? { ...h, page, ...(pages && pages > 0 ? { pages } : {}) } : h
+  );
   persist({ ...state, history });
 }
 

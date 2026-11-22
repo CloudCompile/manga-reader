@@ -251,6 +251,13 @@ must keep working.
 
 ## Reader and theming
 
+History entries carry the page the reader is currently on (not the furthest page
+reached) and the chapter's total pages, which drives the "Continue reading"
+card's page count and progress bar. `setPage` is called after scrolling settles
+and in paged mode whenever the page changes, so resuming a chapter lands on the
+actual last position. A pending resume suppresses progress writes until it has
+scrolled, otherwise opening at the top would overwrite the saved page with 1.
+
 All reader and shelf state lives in `src/lib/storage.ts`, which writes a single
 `Secure` cookie rather than using `localStorage` (some WebViews stub it out).
 That covers theme, fit mode, two-page mode, the anime player's rotation flag,

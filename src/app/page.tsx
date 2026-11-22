@@ -169,6 +169,20 @@ type SortKey = "shelf" | "title" | "chapters" | "latest";
 
 const PROXY = (src: string) => `/api/proxy?url=${encodeURIComponent(src)}`;
 
+// Short, local-clock relative time for the continue card. Kept deliberately
+// coarse: a reader does not need seconds, and a date is better once it is old.
+function timeAgo(timestamp: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(timestamp).toLocaleDateString();
+}
+
 // Shared theme tokens, defined once so the panels (which live at module scope)
 // and the reader agree. Every surface needs both branches: a hardcoded
 // text-white disappears in light mode.
@@ -589,9 +603,11 @@ export default function MangaReader() {
           if (rect.top >= -rect.height / 2) { page = i + 1; break; }
         }
         const current = dataRef.current;
-        if (current && page > 0 && page > lastPageSaved.current && currentUrlRef.current) {
+        // Wait for a pending resume to land, otherwise the scroll position at
+        // the top of the chapter would overwrite the saved page with 1.
+        if (current && page > 0 && page !== lastPageSaved.current && !resumeRef.current && currentUrlRef.current) {
           lastPageSaved.current = page;
-          setPage(currentUrlRef.current, page);
+          setPage(currentUrlRef.current, page, current.images.length);
           setHistory(getHistory());
         }
       }, 400);
@@ -612,10 +628,10 @@ export default function MangaReader() {
   // In paged mode, record the page reached as it changes. The scroll handler
   // does this for the scrolling reader, but it is inert here.
   useEffect(() => {
-    if (!paged || !data?.images.length || !currentUrlRef.current) return;
-    if (currentPage > lastPageSaved.current) {
+    if (!paged || !data?.images.length || !currentUrlRef.current || !currentPage) return;
+    if (currentPage !== lastPageSaved.current && !resumeRef.current) {
       lastPageSaved.current = currentPage;
-      setPage(currentUrlRef.current, currentPage);
+      setPage(currentUrlRef.current, currentPage, data.images.length);
       setHistory(getHistory());
     }
   }, [paged, currentPage, data]);
@@ -793,10 +809,12 @@ export default function MangaReader() {
     setShowChapters(false);
     setShowMobileMenu(false);
     currentUrlRef.current = chapterUrl;
-    lastPageSaved.current = 0;
-    // Restore the page this chapter was left on, if it was read before.
+    // Restore the page this chapter was left on, if it was read before. This is
+    // the actual last position, not the furthest page ever reached.
     const prior = getHistory().find((h) => h.url === chapterUrl);
-    resumeRef.current = prior?.page && prior.page > 1 ? { url: chapterUrl, page: prior.page } : null;
+    const initialPage = prior?.page && prior.page > 0 ? prior.page : 1;
+    lastPageSaved.current = initialPage;
+    resumeRef.current = initialPage > 1 ? { url: chapterUrl, page: initialPage } : null;
 
     try {
       // A prefetched payload skips the round trip entirely. Drop it on use so a
@@ -819,7 +837,14 @@ export default function MangaReader() {
       dataRef.current = json;
       setData(json);
       setHistory(
-        pushHistory({ url: chapterUrl, mangaName: json.mangaName, chapterNum: json.chapterNum, timestamp: Date.now() })
+        pushHistory({
+          url: chapterUrl,
+          mangaName: json.mangaName,
+          chapterNum: json.chapterNum,
+          timestamp: Date.now(),
+          page: initialPage,
+          pages: json.images.length || undefined,
+        })
       );
 
       // Record reading progress for the series so the chapter list can tick
@@ -1115,6 +1140,9 @@ export default function MangaReader() {
         return;
       }
       if (tries++ < 20) window.setTimeout(attempt, 120);
+      // Give up waiting for layout so progress can be saved again; the reader
+      // still opens at the top of the chapter.
+      else resumeRef.current = null;
     };
     attempt();
     return () => { cancelled = true; };
@@ -1427,7 +1455,7 @@ export default function MangaReader() {
               className={`w-full text-left px-3 py-2 rounded-lg text-sm ${hoverBg} ${isDark ? "text-white/80" : "text-gray-700"}`}>
               <div className="font-medium">{h.mangaName}</div>
               <div className={`text-xs ${subText}`}>
-                Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""} · {new Date(h.timestamp).toLocaleDateString()}
+                Ch {h.chapterNum}{h.page ? ` · p${h.page}${h.pages ? `/${h.pages}` : ""}` : ""} · {timeAgo(h.timestamp)}
               </div>
             </button>
           ))}
@@ -1444,7 +1472,7 @@ export default function MangaReader() {
               <button onClick={() => { loadChapter(h.url); setShowSaved(false); }}
                 className={`flex-1 min-w-0 text-left px-3 py-2 text-sm ${isDark ? "text-white/80" : "text-gray-700"}`}>
                 <div className="font-medium truncate">{h.mangaName}</div>
-                <div className={`text-xs ${subText}`}>Ch {h.chapterNum}{h.page ? ` · p${h.page}` : ""}</div>
+                <div className={`text-xs ${subText}`}>Ch {h.chapterNum}{h.page ? ` · p${h.page}${h.pages ? `/${h.pages}` : ""}` : ""} · {timeAgo(h.timestamp)}</div>
               </button>
               <button onClick={() => setReadingList(removeFromList(h.url))}
                 aria-label={`Remove ${h.mangaName} chapter ${h.chapterNum} from the reading list`}
@@ -1673,6 +1701,11 @@ export default function MangaReader() {
     // entry happened to have a saved page rather than the one last read, so the
     // headline could point at an older chapter than the one just closed.
     const recentChapters = history.slice(0, 4);
+    const resume = recentChapters[0];
+    const resumePct =
+      resume?.pages && resume.page
+        ? Math.min(100, Math.max(1, Math.round((resume.page / resume.pages) * 100)))
+        : 0;
     return (
       <div className={`min-h-screen flex flex-col ${bg} ${textCol}`}>
         {BannerView}
@@ -1734,15 +1767,34 @@ export default function MangaReader() {
                     <button onClick={() => setShowHistory(true)} className={`text-xs ${subText} hover:underline`}>See all</button>
                   )}
                 </div>
-                <button onClick={() => loadChapter(recentChapters[0].url)}
+                <button onClick={() => loadChapter(resume.url)}
+                  aria-label={`Continue reading ${resume.mangaName}${resume.chapterNum ? ` chapter ${resume.chapterNum}` : ""}`}
                   className={`w-full inline-flex items-center gap-3 px-4 py-3 rounded-xl border text-left transition-colors ${isDark ? "border-white/10 hover:border-white/25 bg-white/[0.03]" : "border-gray-200 hover:border-gray-300 bg-white"}`}>
                   <BookOpen className={`h-5 w-5 shrink-0 ${isDark ? "text-white/70" : "text-gray-500"}`} />
                   <span className="min-w-0 flex-1">
                     <span className="block text-sm font-medium truncate">
-                      {recentChapters[0].mangaName}
-                      {recentChapters[0].chapterNum && <span className={subText}> · Ch {recentChapters[0].chapterNum}</span>}
-                      {recentChapters[0].page ? <span className={subText}> · p{recentChapters[0].page}</span> : null}
+                      {resume.mangaName}
+                      {resume.chapterNum && <span className={subText}> · Ch {resume.chapterNum}</span>}
                     </span>
+                    <span className={`mt-1 flex items-center gap-1.5 text-[11px] ${subText}`}>
+                      <span>
+                        {resume.page && resume.pages
+                          ? `Page ${resume.page} of ${resume.pages}`
+                          : resume.page
+                            ? `Page ${resume.page}`
+                            : "Start reading"}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>{timeAgo(resume.timestamp)}</span>
+                    </span>
+                    {resumePct > 0 && (
+                      <span className={`mt-2 block h-1.5 overflow-hidden rounded-full ${isDark ? "bg-white/10" : "bg-gray-200"}`}
+                        role="progressbar" aria-label="Chapter progress" aria-valuemin={1}
+                        aria-valuemax={resume.pages} aria-valuenow={resume.page}>
+                        <span className={`block h-full rounded-full ${isDark ? "bg-white/70" : "bg-gray-800"}`}
+                          style={{ width: `${resumePct}%` }} />
+                      </span>
+                    )}
                   </span>
                   <ChevronRight className={`h-4 w-4 shrink-0 ${subText}`} />
                 </button>
@@ -1753,7 +1805,8 @@ export default function MangaReader() {
                       <span className={`block text-sm truncate ${subText}`}>
                         {entry.mangaName}
                         {entry.chapterNum && <span> · Ch {entry.chapterNum}</span>}
-                        {entry.page ? <span> · p{entry.page}</span> : null}
+                        {entry.page ? <span> · p{entry.page}{entry.pages ? `/${entry.pages}` : ""}</span> : null}
+                        <span> · {timeAgo(entry.timestamp)}</span>
                       </span>
                     </span>
                     <ChevronRight className={`h-3.5 w-3.5 shrink-0 ${subText}`} />
