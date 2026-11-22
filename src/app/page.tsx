@@ -1208,7 +1208,10 @@ export default function MangaReader() {
   // to the next chapter. Previously any click jumped straight to the next
   // chapter, so a stray click mid-chapter lost the reader's place. Clicks are
   // also ignored while text is selected, so copying a line does not navigate.
-  const onImageClick = () => {
+  const onImageClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // Controls inside the page area (notably a failed page's Retry button)
+    // must not double as the click-to-scroll target.
+    if ((e.target as HTMLElement).closest("button, a, input, textarea, select, label")) return;
     if (typeof window !== "undefined" && window.getSelection()?.toString()) return;
     // In paged mode a click advances one page (or chapter at the end) rather
     // than nudging the scroll position.
@@ -2256,7 +2259,7 @@ export default function MangaReader() {
                       // and never starts loading. The placeholder sits over it
                       // and keeps scroll position stable until the real size is
                       // known.
-                      <div className="absolute inset-0 flex items-center justify-center" style={{ maxWidth: wide ? "50%" : "800px", marginInline: "auto" }}>
+                      <div className="absolute inset-0 z-10 flex items-center justify-center" style={{ maxWidth: wide ? "50%" : "800px", marginInline: "auto" }}>
                         {failed ? (
                           <button type="button" onClick={(e) => { e.stopPropagation(); retryImage(i); }}
                             aria-label={`Retry page ${i + 1}`}
@@ -2273,7 +2276,7 @@ export default function MangaReader() {
                       alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
                       onError={() => handleImageError(i)}
                       decoding="async"
-                      style={{ ...wideStyle, opacity: failed ? 0 : 1, minHeight: loaded ? undefined : "70vh" }}
+                      style={{ ...wideStyle, opacity: failed ? 0 : 1, minHeight: loaded ? undefined : "70vh", pointerEvents: loaded ? undefined : "none" }}
                       // Paged mode renders only the visible page, so its index can
                       // be any number; it must load eagerly or the lazy heuristic
                       // would leave a blank page until it scrolls into view, which

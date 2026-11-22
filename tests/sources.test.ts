@@ -195,4 +195,26 @@ export async function run(): Promise<void> {
     );
     assert(items.every((c) => c.url.includes("/c/")), "every chapter should have a resolvable code URL");
   });
+
+  // Older chapters only publish the first few pages at the canonical CDN
+  // imageUrl; the rest exist on the page's `src` mirror. Reading imageUrl alone
+  // sent the reader a 404 for every page after the first few.
+  await test("specterscans uses the mirror for pages missing from the CDN", () => {
+    const chapterUrl = "https://specterscans.com/series/haikyu/c/3837egcqpcczz";
+    const source = getSource(chapterUrl);
+    assertEqual(source!.id, "specterscans", "wrong source matched");
+    const parsed = source!.parseChapter!(read("spectre-chapter-mirror.html"), chapterUrl);
+    assertEqual(parsed.images.length, 2, "expected two page images");
+    assertEqual(
+      parsed.images[0],
+      "https://cdn.specterscans.com/haikyu/ch-000402/001.png",
+      "a page without a mirror should keep imageUrl"
+    );
+    assertEqual(
+      parsed.images[1],
+      "https://img.specterscans.com/w4/manga/Haikyu/0402-002.png",
+      "a page with a mirror should use it"
+    );
+    assertEqual(parsed.chapterNum, "402", "chapter number should come from the payload");
+  });
 }

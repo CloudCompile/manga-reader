@@ -817,9 +817,19 @@ function spectreImages(html: string): string[] {
     out.push(url);
   };
   // The reader serialises its page list into the RSC payload; prefer it over
-  // the markup because lazy pages are not always rendered as <img>.
-  const payload = /"imageUrl\\?":\\?"([^"]+)"/g;
+  // the markup because lazy pages are not always rendered as <img>. Each page
+  // carries both `imageUrl` and `src`: the CDN `imageUrl` is canonical but for
+  // older chapters only the first few pages exist, while `src` is a mirror
+  // that has the whole chapter. Prefer the mirror when it is a real URL, and
+  // fall back to `imageUrl` when `src` is `$undefined`.
+  const pageRe = /"imageUrl\\?":\\?"([^"]+)\\?"[^}]*?"src\\?":\\?"([^"]*)\\?"/g;
   let m: RegExpExecArray | null;
+  while ((m = pageRe.exec(html)) !== null) {
+    const mirror = m[2].replace(/\\+$/, "").replace(/\\\//g, "/").replace(/&amp;/g, "&");
+    push(/^https?:\/\//i.test(mirror) ? mirror : m[1]);
+  }
+  if (out.length) return out;
+  const payload = /"imageUrl\\?":\\?"([^"]+)"/g;
   while ((m = payload.exec(html)) !== null) push(m[1]);
   if (out.length) return out;
   for (const tag of html.match(/<img\b[^>]*>/gi) || []) {
