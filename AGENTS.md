@@ -235,9 +235,17 @@ route) so the Node tests can exercise them without resolving the `@/` alias.
 `src/app/manifest.ts` and `public/sw.js` make the app installable. The service
 worker caches the shell (network-first, so a new build is never masked by a
 stale one) and proxied page images (cache-first, bounded to `MAX_IMAGES`). Only
-`image/*` responses are cached, so a 502 error body is never pinned. The
-reader's "Cache" button (`prefetchChapterPages`) deliberately pulls every page of
-the open chapter through the proxy. `ServiceWorkerRegistrar` registers it
+`image/*` responses are cached, so a 502 error body is never pinned, and the
+write completes before the response is handed back so "cache then reload"
+really finds the pages. The reader's "Cache" button (`prefetchChapterPages`)
+deliberately pulls every page of the open chapter through the proxy and retries
+failures; it only marks the chapter cached when every page came back.
+
+Reader page images must stay in normal flow while loading. Hiding them with
+`display:none` (the old approach) gives a `loading="lazy"` image no box to
+intersect, so pages past the eager/warmed ones never start loading at all.
+The placeholder is an absolute overlay instead, and a page that still fails
+after two automatic retries offers its own Retry button. `ServiceWorkerRegistrar` registers it
 best-effort and swallows every failure, since a browser without service workers
 must keep working.
 

@@ -57,8 +57,14 @@ self.addEventListener("fetch", (event) => {
           const res = await fetch(req);
           // Only cache real images; a 502 error body must not be pinned.
           if (res.ok && (res.headers.get("content-type") || "").startsWith("image/")) {
-            cache.put(req, res.clone());
-            trimCache(cache, MAX_IMAGES);
+            // Finish the write before the response reaches the page, so a
+            // reload right after "Cache chapter" finds every page cached.
+            try {
+              await cache.put(req, res.clone());
+            } catch {
+              /* storage full: still serve the image */
+            }
+            trimCache(cache, MAX_IMAGES).catch(() => undefined);
           }
           return res;
         } catch (err) {

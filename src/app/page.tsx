@@ -306,23 +306,29 @@ async function prefetchChapterPages(
   onProgress?: (done: number, total: number) => void
 ): Promise<number> {
   if (PREFETCHED_PAGES.has(chapterUrl)) return 0;
-  PREFETCHED_PAGES.add(chapterUrl);
   let done = 0;
   for (const src of images) {
-    try {
-      await new Promise<void>((resolve) => {
-        const img = new Image();
-        img.decoding = "async";
-        img.onload = () => resolve();
-        img.onerror = () => resolve();
-        img.src = PROXY(src);
-      });
-    } catch {
-      /* one failed page must not stop the rest */
+    let ok = false;
+    // A single upstream hiccup should not leave a hole in the cached chapter,
+    // and a failed attempt may have been pinned by an intermediary, so retries
+    // carry a token that makes them a distinct request.
+    for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+      try {
+        const res = await fetch(PROXY(src) + (attempt ? `&r=${attempt}` : ""), { cache: "reload" });
+        const type = res.headers.get("content-type") || "";
+        ok = res.ok && type.startsWith("image/");
+        if (ok) await res.blob();
+      } catch {
+        /* retry below */
+      }
+      if (!ok) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
     }
-    done += 1;
+    if (ok) done += 1;
     onProgress?.(done, images.length);
   }
+  // Only claim the chapter is cached when every page actually came back; a
+  // partial run must stay retryable instead of short-circuiting on the next tap.
+  if (done === images.length) PREFETCHED_PAGES.add(chapterUrl);
   return done;
 }
 
@@ -339,6 +345,10 @@ export default function MangaReader() {
   const [paged, setPaged] = useState(false);
   const [rtl, setRtl] = useState(false);
   const [loadedImages, setLoadedImages] = useState<Set<number>>(new Set());
+  const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
+  // Incremented per page to force a fresh request after a load error.
+  const [imageNonces, setImageNonces] = useState<Record<number, number>>({});
+  const imageAttempts = useRef<Map<number, number>>(new Map());
   const [chapters, setChapters] = useState<ChapterItem[]>([]);
   const [volumes, setVolumes] = useState<string[]>([]);
   const [groupMode, setGroupMode] = useState<GroupMode>("chapter");
@@ -724,8 +734,46 @@ export default function MangaReader() {
   }, [data?.nextUrl, data?.prevUrl]);
 
   const handleImageLoad = useCallback((index: number) => {
+    imageAttempts.current.delete(index);
+    setFailedImages((prev) => {
+      if (!prev.has(index)) return prev;
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
     setLoadedImages((prev) => new Set(prev).add(index));
   }, []);
+
+  // A page image can fail transiently (upstream 5xx, a rate-limited CDN). Retry
+  // twice with a small backoff before showing a manual retry, so one dropped
+  // request does not leave a permanent hole in the chapter.
+  const handleImageError = useCallback((index: number) => {
+    setLoadedImages((prev) => {
+      if (!prev.has(index)) return prev;
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
+    const attempts = (imageAttempts.current.get(index) || 0) + 1;
+    imageAttempts.current.set(index, attempts);
+    if (attempts <= 2) {
+      window.setTimeout(() => {
+        setImageNonces((prev) => ({ ...prev, [index]: (prev[index] || 0) + 1 }));
+      }, 400 * attempts);
+      return;
+    }
+    setFailedImages((prev) => new Set(prev).add(index));
+  }, []);
+
+  const retryImage = (index: number) => {
+    imageAttempts.current.delete(index);
+    setFailedImages((prev) => {
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
+    setImageNonces((prev) => ({ ...prev, [index]: (prev[index] || 0) + 1 }));
+  };
 
   const loadChapter = useCallback(async (chapterUrl: string) => {
     if (!chapterUrl.trim()) return;
@@ -733,6 +781,9 @@ export default function MangaReader() {
     setBanner(null);
     setData(null);
     setLoadedImages(new Set());
+    setFailedImages(new Set());
+    setImageNonces({});
+    imageAttempts.current.clear();
     setCurrentPage(0);
     setShowScrollTop(false);
     setChromeHidden(false);
@@ -931,11 +982,14 @@ export default function MangaReader() {
       setPrefetchProgress({ done: d, total })
     );
     setPrefetchProgress(null);
+    const total = data.images.length;
     setBanner({
-      kind: "info",
-      text: done
-        ? `Cached ${done} page${done === 1 ? "" : "s"} for offline reading.`
-        : "This chapter is already cached.",
+      kind: done === total ? "info" : "error",
+      text: done === total
+        ? `Cached all ${done} page${done === 1 ? "" : "s"} for offline reading.`
+        : done
+          ? `Cached ${done} of ${total} pages. Try again for the rest.`
+          : "Nothing new to cache — this chapter may already be cached.",
     });
   };
 
@@ -2136,23 +2190,45 @@ export default function MangaReader() {
         <div className={`flex flex-col items-center ${wide ? "mx-auto max-w-[1600px]" : ""}`} dir={rtl ? "rtl" : undefined}>
           {(paged ? (pagedGroup ? [pagedGroup] : []) : pageGroups).map((group, gi) => (
             <div key={gi} className={`w-full flex ${group.length > 1 ? "flex-row justify-center" : "flex-col items-center"}`}>
-              {group.map((i) => (
-                <div key={i} className="relative w-full" style={i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : undefined}>
-                  {!loadedImages.has(i) && (
-                    // A neutral placeholder keeps scroll position stable while
-                    // the real dimensions are unknown; no fixed ratio to guess.
-                    <div className={`w-full mx-auto ${isDark ? "bg-white/[0.04]" : "bg-gray-200/60"} animate-pulse`} style={{ minHeight: "70vh", maxWidth: wide ? "50%" : "800px" }} />
-                  )}
-                  <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
-                    src={displayImages[i]} alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
-                    style={{ ...wideStyle, display: loadedImages.has(i) ? "block" : "none" }}
-                    // Paged mode renders only the visible page, so its index can
-                    // be any number; it must load eagerly or the lazy heuristic
-                    // would leave a blank page until it scrolls into view, which
-                    // never happens here.
-                    loading={paged || i < 3 ? "eager" : "lazy"} />
-                </div>
-              ))}
+              {group.map((i) => {
+                const loaded = loadedImages.has(i);
+                const failed = failedImages.has(i);
+                const nonce = imageNonces[i] || 0;
+                return (
+                  <div key={i} className="relative w-full"
+                    style={{ minHeight: loaded ? undefined : "70vh", ...(i === 0 ? { marginTop: data.warning ? "0.5rem" : "0" } : {}) }}>
+                    {!loaded && (
+                      // The image stays in normal flow (not display:none) while
+                      // it loads, otherwise a lazy image has no box to intersect
+                      // and never starts loading. The placeholder sits over it
+                      // and keeps scroll position stable until the real size is
+                      // known.
+                      <div className="absolute inset-0 flex items-center justify-center" style={{ maxWidth: wide ? "50%" : "800px", marginInline: "auto" }}>
+                        {failed ? (
+                          <button type="button" onClick={(e) => { e.stopPropagation(); retryImage(i); }}
+                            aria-label={`Retry page ${i + 1}`}
+                            className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors ${isDark ? "border-white/20 bg-white/10 text-white hover:bg-white/20" : "border-gray-300 bg-white text-gray-700 hover:bg-gray-100"}`}>
+                            <RotateCcw className="h-4 w-4" /> Retry page {i + 1}
+                          </button>
+                        ) : (
+                          <div className={`w-full h-full ${isDark ? "bg-white/[0.04]" : "bg-gray-200/60"} animate-pulse`} />
+                        )}
+                      </div>
+                    )}
+                    <img ref={(el) => { if (el) imgRefs.current.set(i, el); }}
+                      src={nonce ? `${displayImages[i]}&r=${nonce}` : displayImages[i]}
+                      alt={`Page ${i + 1}`} onLoad={() => handleImageLoad(i)}
+                      onError={() => handleImageError(i)}
+                      decoding="async"
+                      style={{ ...wideStyle, opacity: failed ? 0 : 1, minHeight: loaded ? undefined : "70vh" }}
+                      // Paged mode renders only the visible page, so its index can
+                      // be any number; it must load eagerly or the lazy heuristic
+                      // would leave a blank page until it scrolls into view, which
+                      // never happens here.
+                      loading={paged || i < 3 ? "eager" : "lazy"} />
+                  </div>
+                );
+              })}
             </div>
           ))}
         </div>
