@@ -146,6 +146,8 @@ interface AnimeMatch {
   matched: boolean;
   animeTitle?: string;
   poster?: string;
+  // Each episode carries its provider, so the player streams from the same
+  // host the id came from.
   episodes: AnimeEpisode[];
   // Populated when nothing matched confidently, so the picker can offer the
   // closest search hits instead of a dead end.
